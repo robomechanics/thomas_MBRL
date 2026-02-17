@@ -12,3 +12,10 @@ from .tasks import *
 
 # Register UI extensions.
 from .ui_extension_example import *
+
+from gymnasium.envs.registration import register
+
+register(
+    id="Thomas-Go2-Velocity-v0",
+    entry_point="thomas_MBRL.envs.go2_velocity_env:MyGo2VelocityEnv",
+)
