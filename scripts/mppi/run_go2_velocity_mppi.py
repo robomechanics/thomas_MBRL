@@ -1,113 +1,159 @@
-# import gymnasium as gym
-# import torch
+# scripts/mppi/run_go2_velocity_mppi.py
 
-# TASK = "Thomas-Go2-Velocity-v0"
+import argparse
+import os
+import sys
 
-# device = "cuda"
-# K = 64
+from isaaclab.app import AppLauncher
 
-# env = gym.make(
-#     TASK,
-#     num_envs=1 + K,
-#     device=device,
-#     headless=True,
-# )
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+SOURCE_ROOT = os.path.join(PROJECT_ROOT, "source", "thomas_MBRL")
+if SOURCE_ROOT not in sys.path:
+    sys.path.insert(0, SOURCE_ROOT)
 
-# obs, _ = env.reset()
 
-# robot = env.unwrapped.scene["robot"]
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    AppLauncher.add_app_launcher_args(parser)
+    args = parser.parse_args()
 
-# print("Robot found.")
+    app_launcher = AppLauncher(args)
+    simulation_app = app_launcher.app
 
-# # Snapshot real env (env 0)
-# root_state = robot.data.root_state_w[0].clone()
-# joint_pos = robot.data.joint_pos[0].clone()
-# joint_vel = robot.data.joint_vel[0].clone()
+    import thomas_MBRL  # noqa: F401
+    import gymnasium as gym
+    import torch
 
-# # Clone into rollout envs
-# env_ids = torch.arange(1, K+1, device=device)
+    from thomas_MBRL.envs.go2_velocity_env_cfg import ThomasGo2VelocityEnvCfg
 
-# robot.write_root_pose_to_sim(
-#     root_state[:7].repeat(K, 1),
-#     env_ids=env_ids,
-# )
+    K = 64
+    device = "cuda"
 
-# robot.write_root_velocity_to_sim(
-#     root_state[7:].repeat(K, 1),
-#     env_ids=env_ids,
-# )
+    cfg = ThomasGo2VelocityEnvCfg()
+    cfg.scene.num_envs = 1 + K
+    cfg.sim.device = device
 
-# robot.write_joint_state_to_sim(
-#     joint_pos.repeat(K, 1),
-#     joint_vel.repeat(K, 1),
-#     env_ids=env_ids,
-# )
+    env = gym.make("Thomas-Go2-Velocity-v0", cfg=cfg)
+    obs, _ = env.reset()
 
-# print("State cloning successful.")
+    robot = env.unwrapped.scene["robot"]
+    print("Robot found.")
 
-# actions = torch.zeros((1 + K, env.action_space.shape[0]), device=device)
-# env.step(actions)
+    action_dim = env.unwrapped.action_manager.total_action_dim
+    print(f"Action dim: {action_dim}")
 
-# print("Step successful.")
+    # MPPI settings
+    K_test = 32
+    H_test = 10
+    sigma = 0.03
+    lam = 1.0
+    target_height = 0.32
 
-import gymnasium as gym
-import torch
+    # rollout env ids
+    env_ids_test = torch.arange(1, K_test + 1, device=device)
 
-TASK = "Thomas-Go2-Velocity-v0"
-device = "cuda"
+    # nominal action sequence
+    u_nom = torch.zeros((H_test, action_dim), device=device)
 
-K = 128
-H = 15
-lam = 1.0
-sigma = 0.1
+    print("Starting continuous MPPI control...")
 
-env = gym.make(TASK, num_envs=1 + K, device=device, headless=True)
-obs, _ = env.reset()
+    for outer in range(100):
+        print(f"\n=== MPPI iteration {outer + 1} ===")
 
-robot = env.unwrapped.scene["robot"]
-act_dim = env.action_space.shape[0]
+        # Snapshot env0
+        root_state = robot.data.root_state_w[0].clone()
+        joint_pos = robot.data.joint_pos[0].clone()
+        joint_vel = robot.data.joint_vel[0].clone()
 
-u_nom = torch.zeros((H, act_dim), device=device)
+        # Clone env0 state into rollout envs
+        robot.write_root_pose_to_sim(
+            root_state[:7].repeat(K_test, 1),
+            env_ids=env_ids_test,
+        )
+        robot.write_root_velocity_to_sim(
+            root_state[7:].repeat(K_test, 1),
+            env_ids=env_ids_test,
+        )
+        robot.write_joint_state_to_sim(
+            joint_pos.repeat(K_test, 1),
+            joint_vel.repeat(K_test, 1),
+            env_ids=env_ids_test,
+        )
 
-for outer in range(1000):
+        # Fresh rollout samples
+        costs = torch.zeros(K_test, device=device)
+        noise = sigma * torch.randn((K_test, H_test, action_dim), device=device)
 
-    # Snapshot real state
-    root_state = robot.data.root_state_w[0].clone()
-    joint_pos = robot.data.joint_pos[0].clone()
-    joint_vel = robot.data.joint_vel[0].clone()
+        # Rollout loop
+        for t in range(H_test):
+            actions = torch.zeros((1 + K, action_dim), device=device)
 
-    env_ids = torch.arange(1, K+1, device=device)
+            # rollout envs use nominal + sampled noise
+            actions[1:1 + K_test] = u_nom[t] + noise[:, t]
 
-    robot.write_root_pose_to_sim(root_state[:7].repeat(K, 1), env_ids)
-    robot.write_root_velocity_to_sim(root_state[7:].repeat(K, 1), env_ids)
-    robot.write_joint_state_to_sim(joint_pos.repeat(K, 1),
-                                   joint_vel.repeat(K, 1),
-                                   env_ids)
+            obs, reward, terminated, truncated, info = env.step(actions)
 
-    noise = sigma * torch.randn((K, H, act_dim), device=device)
-    costs = torch.zeros(K, device=device)
+            # rollout states
+            base_vel = robot.data.root_state_w[1:1 + K_test, 7:10]
+            base_pos = robot.data.root_state_w[1:1 + K_test, 0:3]
+            projected_gravity = robot.data.projected_gravity_b[1:1 + K_test]
 
-    for t in range(H):
-        actions = torch.zeros((1 + K, act_dim), device=device)
-        actions[1:] = u_nom[t] + noise[:, t]
+            # rollout commands
+            cmd = env.unwrapped.command_manager.get_command("base_velocity")[1:1 + K_test]
 
-        obs, _, _, _, _ = env.step(actions)
+            # cost terms
+            vel_error = (base_vel[:, :2] - cmd[:, :2]) ** 2
+            height_error = (base_pos[:, 2] - target_height) ** 2
+            upright_cost = projected_gravity[:, 0] ** 2 + projected_gravity[:, 1] ** 2
+            control_cost = (actions[1:1 + K_test] ** 2).sum(dim=1)
 
-        # Minimal cost: velocity tracking
-        base_vel = robot.data.root_state_w[1:, 7:10]
-        cmd = env.unwrapped.command_manager.get_command("base_velocity")[1:]
+            step_cost = (
+                vel_error.sum(dim=1)
+                + 2.0 * height_error
+                + 1.0 * upright_cost
+                + 0.001 * control_cost
+            )
 
-        vel_error = (base_vel[:, :2] - cmd[:, :2]) ** 2
-        costs += vel_error.sum(dim=1)
+            costs += step_cost
 
-        costs += 0.001 * (actions[1:] ** 2).sum(dim=1)
+        # MPPI update
+        weights = torch.softmax(-costs / lam, dim=0)
+        delta = torch.einsum("k,khd->hd", weights, noise)
+        u_nom = u_nom + delta
 
-    weights = torch.softmax(-costs / lam, dim=0)
-    delta = torch.einsum("k,khd->hd", weights, noise)
-    u_nom += delta
+        best_idx = torch.argmin(costs).item()
+        best_cost = costs[best_idx].item()
 
-    real_actions = torch.zeros((1 + K, act_dim), device=device)
-    real_actions[0] = u_nom[0]
-    env.step(real_actions)
+        print(f"Best rollout cost: {best_cost}")
+        print(f"Best rollout index: {best_idx}")
 
-    u_nom = torch.cat([u_nom[1:], torch.zeros_like(u_nom[:1])], dim=0)
+        # Apply first optimized action to env0
+        real_actions = torch.zeros((1 + K, action_dim), device=device)
+        real_actions[0] = u_nom[0]
+
+        obs, reward, terminated, truncated, info = env.step(real_actions)
+
+        # Diagnostics for env0
+        base_vel0 = robot.data.root_state_w[0, 7:10]
+        base_pos0 = robot.data.root_state_w[0, 0:3]
+        proj_grav0 = robot.data.projected_gravity_b[0]
+        cmd0 = env.unwrapped.command_manager.get_command("base_velocity")[0]
+
+        print("env0 vel:", base_vel0.detach().cpu().numpy())
+        print("env0 pos:", base_pos0.detach().cpu().numpy())
+        print("env0 cmd:", cmd0.detach().cpu().numpy())
+        print("env0 projected gravity:", proj_grav0.detach().cpu().numpy())
+        print("Applied MPPI action to env0.")
+
+        # Shift nominal sequence
+        u_nom = torch.cat([u_nom[1:], torch.zeros_like(u_nom[:1])], dim=0)
+
+        # Optional: keep nominal sequence bounded
+        u_nom = torch.clamp(u_nom, -0.5, 0.5)
+
+    env.close()
+    simulation_app.close()
+
+
+if __name__ == "__main__":
+    main()
