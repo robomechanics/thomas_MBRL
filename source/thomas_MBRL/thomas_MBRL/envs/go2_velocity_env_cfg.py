@@ -1,13 +1,16 @@
-from isaaclab_tasks.locomotion.velocity.velocity_env_cfg import (
-    UnitreeGo2VelocityFlatEnvCfg,
-)
+# source/thomas_MBRL/thomas_MBRL/envs/go2_velocity_env_cfg.py
 
-class MyGo2VelocityEnvCfg(UnitreeGo2VelocityFlatEnvCfg):
+from isaaclab_tasks.manager_based.locomotion.velocity.config.go2.flat_env_cfg import UnitreeGo2FlatEnvCfg
+
+
+class ThomasGo2VelocityEnvCfg(UnitreeGo2FlatEnvCfg):
+    """Thomas custom Go2 velocity task config."""
+
     def __post_init__(self):
         super().__post_init__()
 
-        # Keep identical for now
-        self.scene.num_envs = 1024
+        # number of parallel envs (was num_envs=... in gym.make before)
+        self.scene.num_envs = 65
 
-        # Example for later experiments:
-        # self.rewards.lin_vel_xy = 1.5
+        # device (was device="cuda" in gym.make before)
+        self.sim.device = "cuda"

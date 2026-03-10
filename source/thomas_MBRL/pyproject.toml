@@ -1,3 +1,16 @@
 [build-system]
 requires = ["setuptools", "wheel", "toml"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "thomas_MBRL"
+version = "0.0.1"
+description = "Thomas MBRL tasks for IsaacLab"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools]
+package-dir = {"" = "source/thomas_MBRL"}
+
+[tool.setuptools.packages.find]
+where = ["source/thomas_MBRL"]
