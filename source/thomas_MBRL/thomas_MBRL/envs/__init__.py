@@ -7,7 +7,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        # IMPORTANT: this must be a STRING entry point, same style as IsaacLab
         "env_cfg_entry_point": "thomas_MBRL.envs.go2_velocity_env_cfg:ThomasGo2VelocityEnvCfg",
+        "skrl_cfg_entry_point": "isaaclab_tasks.manager_based.locomotion.velocity.config.go2.agents:skrl_flat_ppo_cfg.yaml",
     },
 )

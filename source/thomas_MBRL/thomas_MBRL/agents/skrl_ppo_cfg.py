@@ -1,0 +1,71 @@
+# source/thomas_MBRL/thomas_MBRL/agents/skrl_ppo_cfg.py
+
+SKRL_PPO_CONFIG = {
+    "seed": 42,
+    "models": {
+        "separate": False,
+        "policy": {
+            "class": "GaussianMixin",
+            "clip_actions": False,
+            "clip_log_std": True,
+            "min_log_std": -20.0,
+            "max_log_std": 2.0,
+            "initial_log_std": 0.0,
+            "network": {
+                "class": "MLP",
+                "hidden_units": [256, 128, 64],
+                "activation": "elu",
+            },
+            "output": "ACTIONS",
+        },
+        "value": {
+            "class": "DeterministicMixin",
+            "clip_actions": False,
+            "network": {
+                "class": "MLP",
+                "hidden_units": [256, 128, 64],
+                "activation": "elu",
+            },
+            "output": "ONE",
+        },
+    },
+    "agent": {
+        "class": "PPO",
+        "rollouts": 24,
+        "learning_epochs": 5,
+        "mini_batches": 6,
+        "discount_factor": 0.99,
+        "lambda": 0.95,
+        "learning_rate": 3e-4,
+        "learning_rate_scheduler": "KLAdaptiveRL",
+        "learning_rate_scheduler_kwargs": {
+            "kl_threshold": 0.008,
+        },
+        "random_timesteps": 0,
+        "learning_starts": 0,
+        "grad_norm_clip": 1.0,
+        "ratio_clip": 0.2,
+        "value_clip": 0.2,
+        "clip_predicted_values": True,
+        "entropy_loss_scale": 0.0,
+        "value_loss_scale": 2.0,
+        "kl_threshold": 0.0,
+        "rewards_shaper": None,
+        "time_limit_bootstrap": False,
+        "state_preprocessor": "RunningStandardScaler",
+        "state_preprocessor_kwargs": {"size": "STATES"},
+        "value_preprocessor": "RunningStandardScaler",
+        "value_preprocessor_kwargs": {"size": 1},
+        "experiment": {
+            "write_interval": 1000,
+            "checkpoint_interval": 5000,
+            "directory": "go2_velocity",
+            "experiment_name": "",
+        },
+    },
+    "trainer": {
+        "class": "SequentialTrainer",
+        "timesteps": 300000,
+        "environment_info": "episode",
+    },
+}
