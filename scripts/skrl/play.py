@@ -14,6 +14,12 @@ a more user-friendly way.
 
 import argparse
 import sys
+import os
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+SOURCE_ROOT = os.path.join(PROJECT_ROOT, "source", "thomas_MBRL")
+if SOURCE_ROOT not in sys.path:
+    sys.path.insert(0, SOURCE_ROOT)
 
 from isaaclab.app import AppLauncher
 
@@ -105,7 +111,7 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 from isaaclab.utils.dict import print_dict
-from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+
 
 from isaaclab_rl.skrl import SkrlVecEnvWrapper
 
