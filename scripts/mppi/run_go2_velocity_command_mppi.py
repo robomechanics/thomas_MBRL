@@ -90,38 +90,97 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     AppLauncher.add_app_launcher_args(parser)
 
-    parser.add_argument("--policy-path", type=str, required=True,
-                        help="Path to a TorchScript velocity policy checkpoint.")
-    parser.add_argument("--device", type=str, default="cuda",
-                        help="Torch device to use.")
-    parser.add_argument("--iters", type=int, default=100,
-                        help="Number of outer MPPI iterations.")
-    parser.add_argument("--num-rollouts", type=int, default=32,
-                        help="Number of rollout environments used by MPPI.")
-    parser.add_argument("--horizon", type=int, default=20,
-                        help="MPPI planning horizon.")
-    parser.add_argument("--sigma-vx", type=float, default=0.05,
-                        help="Exploration noise standard deviation for vx residual.")
-    parser.add_argument("--sigma-vy", type=float, default=0.05,
-                        help="Exploration noise standard deviation for vy residual.")
-    parser.add_argument("--sigma-wz", type=float, default=0.10,
-                        help="Exploration noise standard deviation for yaw-rate residual.")
-    parser.add_argument("--lambda-mppi", type=float, default=1.0,
-                        help="Temperature parameter for MPPI.")
-    parser.add_argument("--target-vx", type=float, default=0.20,
-                        help="Nominal desired forward velocity.")
-    parser.add_argument("--target-vy", type=float, default=0.00,
-                        help="Nominal desired lateral velocity.")
-    parser.add_argument("--target-wz", type=float, default=0.00,
-                        help="Nominal desired yaw rate.")
-    parser.add_argument("--cmd-limit-vx", type=float, default=0.60,
-                        help="Absolute clamp for commanded vx.")
-    parser.add_argument("--cmd-limit-vy", type=float, default=0.40,
-                        help="Absolute clamp for commanded vy.")
-    parser.add_argument("--cmd-limit-wz", type=float, default=1.20,
-                        help="Absolute clamp for commanded yaw rate.")
-    parser.add_argument("--target-height", type=float, default=0.32,
-                        help="Desired body height for stability cost.")
+    parser.add_argument(
+        "--policy-path",
+        type=str,
+        required=True,
+        help="Path to a TorchScript velocity policy checkpoint.",
+    )
+
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=100,
+        help="Number of outer MPPI iterations.",
+    )
+    parser.add_argument(
+        "--num-rollouts",
+        type=int,
+        default=32,
+        help="Number of rollout environments used by MPPI.",
+    )
+    parser.add_argument(
+        "--horizon",
+        type=int,
+        default=20,
+        help="MPPI planning horizon.",
+    )
+    parser.add_argument(
+        "--sigma-vx",
+        type=float,
+        default=0.05,
+        help="Exploration noise standard deviation for vx residual.",
+    )
+    parser.add_argument(
+        "--sigma-vy",
+        type=float,
+        default=0.05,
+        help="Exploration noise standard deviation for vy residual.",
+    )
+    parser.add_argument(
+        "--sigma-wz",
+        type=float,
+        default=0.10,
+        help="Exploration noise standard deviation for yaw-rate residual.",
+    )
+    parser.add_argument(
+        "--lambda-mppi",
+        type=float,
+        default=1.0,
+        help="Temperature parameter for MPPI.",
+    )
+    parser.add_argument(
+        "--target-vx",
+        type=float,
+        default=0.20,
+        help="Nominal desired forward velocity.",
+    )
+    parser.add_argument(
+        "--target-vy",
+        type=float,
+        default=0.00,
+        help="Nominal desired lateral velocity.",
+    )
+    parser.add_argument(
+        "--target-wz",
+        type=float,
+        default=0.00,
+        help="Nominal desired yaw rate.",
+    )
+    parser.add_argument(
+        "--cmd-limit-vx",
+        type=float,
+        default=0.60,
+        help="Absolute clamp for commanded vx.",
+    )
+    parser.add_argument(
+        "--cmd-limit-vy",
+        type=float,
+        default=0.40,
+        help="Absolute clamp for commanded vy.",
+    )
+    parser.add_argument(
+        "--cmd-limit-wz",
+        type=float,
+        default=1.20,
+        help="Absolute clamp for commanded yaw rate.",
+    )
+    parser.add_argument(
+        "--target-height",
+        type=float,
+        default=0.2,
+        help="Desired body height for stability cost.",
+    )
     args = parser.parse_args()
 
     app_launcher = AppLauncher(args)
@@ -129,10 +188,12 @@ def main() -> None:
 
     import gymnasium as gym
 
+    from isaaclab_tasks.manager_based.locomotion.velocity.config.go2.flat_env_cfg import (
+        UnitreeGo2FlatEnvCfg,
+    )
     from thomas_MBRL.controllers.torch_policy_wrapper import TorchVelocityPolicy
-    from thomas_MBRL.envs.go2_velocity_env_cfg import ThomasGo2VelocityEnvCfg
 
-    device = args.device
+    device = "cuda"
     k_rollouts = args.num_rollouts
     horizon = args.horizon
 
@@ -146,18 +207,27 @@ def main() -> None:
         device=device,
         dtype=torch.float32,
     )
+    # sigma = torch.tensor(
+    #     [args.sigma_vx, args.sigma_vy, args.sigma_wz],
+    #     device=device,
+    #     dtype=torch.float32,
+    # )
     sigma = torch.tensor(
-        [args.sigma_vx, args.sigma_vy, args.sigma_wz],
+        [args.sigma_vx, 0.0, 0.0],
         device=device,
         dtype=torch.float32,
     )
 
-    cfg = ThomasGo2VelocityEnvCfg()
+    cfg = UnitreeGo2FlatEnvCfg()
     cfg.scene.num_envs = 1 + k_rollouts
     cfg.sim.device = device
 
-    env = gym.make("Thomas-Go2-Velocity-v0", cfg=cfg)
+    env = gym.make("Isaac-Velocity-Flat-Unitree-Go2-v0", cfg=cfg)
     obs, _ = env.reset()
+
+    print("Initial observation type:", type(obs))
+    if isinstance(obs, dict):
+        print("Initial observation keys:", obs.keys())
 
     policy = TorchVelocityPolicy(args.policy_path, device)
 
@@ -186,13 +256,33 @@ def main() -> None:
         joint_vel_0 = robot.data.joint_vel[0].clone()
 
         # Clone env0 state into the rollout environments.
-        robot.write_root_pose_to_sim(root_state_0[:7].repeat(k_rollouts, 1), env_ids=rollout_env_ids)
-        robot.write_root_velocity_to_sim(root_state_0[7:].repeat(k_rollouts, 1), env_ids=rollout_env_ids)
+        robot.write_root_pose_to_sim(
+            root_state_0[:7].repeat(k_rollouts, 1),
+            env_ids=rollout_env_ids,
+        )
+        robot.write_root_velocity_to_sim(
+            root_state_0[7:].repeat(k_rollouts, 1),
+            env_ids=rollout_env_ids,
+        )
         robot.write_joint_state_to_sim(
             joint_pos_0.repeat(k_rollouts, 1),
             joint_vel_0.repeat(k_rollouts, 1),
             env_ids=rollout_env_ids,
         )
+        
+        # Warm up rollout envs for a few steps so the policy's action-history
+        # observation becomes consistent with the copied physical state.
+        warmup_steps = 5
+        warmup_cmds = base_cmd.unsqueeze(0).repeat(k_rollouts, 1)
+
+        for _ in range(warmup_steps):
+            _set_base_velocity_command(env, env0_id, env0_cmd.unsqueeze(0))
+            _set_base_velocity_command(env, rollout_env_ids, warmup_cmds)
+
+            fresh_obs = _get_fresh_obs(env, obs)
+            warmup_actions = policy(fresh_obs)
+
+            obs, reward, terminated, truncated, info = env.step(warmup_actions)
 
         costs = torch.zeros(k_rollouts, device=device, dtype=torch.float32)
         noise = torch.randn((k_rollouts, horizon, 3), device=device) * sigma.view(1, 1, 3)
@@ -218,8 +308,9 @@ def main() -> None:
             joint_pos = robot.data.joint_pos[1:1 + k_rollouts]
             joint_vel = robot.data.joint_vel[1:1 + k_rollouts]
 
-            vel_error = (base_vel[:, :2] - base_cmd[:2].unsqueeze(0)) ** 2
-            yaw_error = (base_vel[:, 2] - base_cmd[2]) ** 2
+            vx_error = (base_vel[:, 0] - base_cmd[0]) ** 2
+            vy_cost = base_vel[:, 1] ** 2
+            wz_cost = base_vel[:, 2] ** 2
             height_error = (base_pos[:, 2] - args.target_height) ** 2
             upright_cost = projected_gravity[:, 0] ** 2 + projected_gravity[:, 1] ** 2
             pose_cost = ((joint_pos - joint_pos_0.unsqueeze(0)) ** 2).sum(dim=1)
@@ -227,16 +318,17 @@ def main() -> None:
             residual_cost = ((cmd_residual_t / cmd_limit.unsqueeze(0)) ** 2).sum(dim=1)
 
             fall_penalty = torch.where(base_pos[:, 2] < 0.22, 50.0, 0.0)
-            tilt_penalty = torch.where(upright_cost > 0.25, 25.0, 0.0)
+            tilt_penalty = torch.where(upright_cost > 0.04, 40.0, 0.0)
             done_penalty = 50.0 * (
                 terminated[1:1 + k_rollouts].float() + truncated[1:1 + k_rollouts].float()
             )
 
             step_cost = (
-                8.0 * vel_error.sum(dim=1)
-                + 2.0 * yaw_error
-                + 2.0 * height_error
-                + 2.5 * upright_cost
+                12.0 * vx_error
+                + 10.0 * vy_cost
+                + 4.0 * wz_cost
+                + 6.0 * height_error
+                + 12.0 * upright_cost
                 + 0.15 * pose_cost
                 + 0.01 * vel_joint_cost
                 + 0.05 * residual_cost
@@ -258,8 +350,14 @@ def main() -> None:
         print(f"Best rollout index: {best_idx}")
 
         # Restore env0 to its pre-rollout state so only the chosen command gets applied.
-        robot.write_root_pose_to_sim(root_state_0[:7].unsqueeze(0), env_ids=env0_id)
-        robot.write_root_velocity_to_sim(root_state_0[7:].unsqueeze(0), env_ids=env0_id)
+        robot.write_root_pose_to_sim(
+            root_state_0[:7].unsqueeze(0),
+            env_ids=env0_id,
+        )
+        robot.write_root_velocity_to_sim(
+            root_state_0[7:].unsqueeze(0),
+            env_ids=env0_id,
+        )
         robot.write_joint_state_to_sim(
             joint_pos_0.unsqueeze(0),
             joint_vel_0.unsqueeze(0),
@@ -282,7 +380,7 @@ def main() -> None:
         base_vel0 = robot.data.root_state_w[0, 7:10]
         base_pos0 = robot.data.root_state_w[0, 0:3]
         proj_grav0 = robot.data.projected_gravity_b[0]
-        vel_err0 = base_vel0 - base_cmd
+        vel_err0 = base_vel0 - env0_cmd
 
         print("env0 terminated:", bool(terminated[0].item()))
         print("env0 truncated:", bool(truncated[0].item()))
@@ -296,7 +394,7 @@ def main() -> None:
         u_nom = torch.cat([u_nom[1:], torch.zeros_like(u_nom[:1])], dim=0)
 
         # Keep the residual command modest.
-        residual_limit = 0.35 * cmd_limit
+        residual_limit = 0.15 * cmd_limit
         u_nom = _clamp_commands(u_nom, residual_limit)
 
     env.close()
