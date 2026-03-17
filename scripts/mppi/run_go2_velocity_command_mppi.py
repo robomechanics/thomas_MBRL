@@ -40,13 +40,6 @@ def _get_fresh_obs(env: Any, last_obs: Any) -> Any:
     Isaac Lab environments commonly expose an observation manager. If that path
     is unavailable in the current setup, this function falls back to the most
     recent observation returned by env.step or env.reset.
-
-    Args:
-        env: Gymnasium Isaac Lab environment.
-        last_obs: Previously returned observation object.
-
-    Returns:
-        Current observation object suitable for the policy.
     """
     try:
         return env.unwrapped.observation_manager.compute()
@@ -57,11 +50,6 @@ def _get_fresh_obs(env: Any, last_obs: Any) -> Any:
 def _set_base_velocity_command(env: Any, env_ids: torch.Tensor, commands: torch.Tensor) -> None:
     """
     Write base velocity commands into the command buffer for selected envs.
-
-    Args:
-        env: Gymnasium Isaac Lab environment.
-        env_ids: Tensor of environment indices.
-        commands: Tensor with shape (len(env_ids), 3).
     """
     cmd_buf = env.unwrapped.command_manager.get_command("base_velocity")
     cmd_buf[env_ids, 0] = commands[:, 0]
@@ -72,15 +60,33 @@ def _set_base_velocity_command(env: Any, env_ids: torch.Tensor, commands: torch.
 def _clamp_commands(cmds: torch.Tensor, cmd_limit: torch.Tensor) -> torch.Tensor:
     """
     Clamp commands elementwise to symmetric limits.
-
-    Args:
-        cmds: Tensor of shape (..., 3).
-        cmd_limit: Tensor of shape (3,).
-
-    Returns:
-        Clamped tensor with the same shape as cmds.
     """
     return torch.max(torch.min(cmds, cmd_limit), -cmd_limit)
+
+
+def _freeze_reference_robot(
+    robot: Any,
+    ref_env_id: torch.Tensor,
+    ref_root_state: torch.Tensor,
+    ref_joint_pos: torch.Tensor,
+    ref_joint_vel: torch.Tensor,
+) -> None:
+    """
+    Keep the reference robot frozen at the initial state for visualization.
+    """
+    robot.write_root_pose_to_sim(
+        ref_root_state[:7].unsqueeze(0),
+        env_ids=ref_env_id,
+    )
+    robot.write_root_velocity_to_sim(
+        torch.zeros_like(ref_root_state[7:]).unsqueeze(0),
+        env_ids=ref_env_id,
+    )
+    robot.write_joint_state_to_sim(
+        ref_joint_pos.unsqueeze(0),
+        torch.zeros_like(ref_joint_vel).unsqueeze(0),
+        env_ids=ref_env_id,
+    )
 
 
 def main() -> None:
@@ -96,12 +102,17 @@ def main() -> None:
         required=True,
         help="Path to a TorchScript velocity policy checkpoint.",
     )
-
     parser.add_argument(
         "--iters",
         type=int,
         default=100,
-        help="Number of outer MPPI iterations.",
+        help="Number of outer MPPI replanning iterations.",
+    )
+    parser.add_argument(
+        "--mppi-hold-steps",
+        type=int,
+        default=5,
+        help="Number of low-level policy steps to hold the chosen MPPI command before replanning.",
     )
     parser.add_argument(
         "--num-rollouts",
@@ -178,7 +189,7 @@ def main() -> None:
     parser.add_argument(
         "--target-height",
         type=float,
-        default=0.2,
+        default=0.20,
         help="Desired body height for stability cost.",
     )
     args = parser.parse_args()
@@ -196,6 +207,7 @@ def main() -> None:
     device = "cuda"
     k_rollouts = args.num_rollouts
     horizon = args.horizon
+    hold_steps = args.mppi_hold_steps
 
     base_cmd = torch.tensor(
         [args.target_vx, args.target_vy, args.target_wz],
@@ -207,11 +219,6 @@ def main() -> None:
         device=device,
         dtype=torch.float32,
     )
-    # sigma = torch.tensor(
-    #     [args.sigma_vx, args.sigma_vy, args.sigma_wz],
-    #     device=device,
-    #     dtype=torch.float32,
-    # )
     sigma = torch.tensor(
         [args.sigma_vx, 0.0, 0.0],
         device=device,
@@ -220,6 +227,7 @@ def main() -> None:
 
     cfg = UnitreeGo2FlatEnvCfg()
     cfg.scene.num_envs = 1 + k_rollouts
+    cfg.scene.env_spacing = 3.0
     cfg.sim.device = device
 
     env = gym.make("Isaac-Velocity-Flat-Unitree-Go2-v0", cfg=cfg)
@@ -234,10 +242,24 @@ def main() -> None:
     robot = env.unwrapped.scene["robot"]
     action_dim = env.unwrapped.action_manager.total_action_dim
     print(f"Action dim from low-level policy/env interface: {action_dim}")
-    print("Starting command-space MPPI control...")
+    print(f"Starting command-space MPPI control with hold_steps={hold_steps}...")
 
     env0_id = torch.tensor([0], device=device, dtype=torch.long)
+    ref_env_id = torch.tensor([1], device=device, dtype=torch.long)
     rollout_env_ids = torch.arange(1, k_rollouts + 1, device=device, dtype=torch.long)
+
+    # Save a frozen reference robot at the initial state for visualization.
+    ref_root_state = robot.data.root_state_w[0].clone()
+    ref_joint_pos = robot.data.joint_pos[0].clone()
+    ref_joint_vel = robot.data.joint_vel[0].clone()
+
+    _freeze_reference_robot(
+        robot,
+        ref_env_id,
+        ref_root_state,
+        ref_joint_pos,
+        ref_joint_vel,
+    )
 
     # The optimized variable is not the env action. It is a residual on the
     # commanded base velocity.
@@ -269,20 +291,51 @@ def main() -> None:
             joint_vel_0.repeat(k_rollouts, 1),
             env_ids=rollout_env_ids,
         )
-        
-        # Warm up rollout envs for a few steps so the policy's action-history
-        # observation becomes consistent with the copied physical state.
+
+        # Immediately restore the reference robot so it stays frozen even though
+        # ref_env_id is included inside rollout_env_ids.
+        _freeze_reference_robot(
+            robot,
+            ref_env_id,
+            ref_root_state,
+            ref_joint_pos,
+            ref_joint_vel,
+        )
+
+        # Warm up rollout envs so the policy can settle onto the copied state.
         warmup_steps = 5
         warmup_cmds = base_cmd.unsqueeze(0).repeat(k_rollouts, 1)
+
+        # Keep the reference robot command at zero for visualization.
+        warmup_cmds[0] = torch.zeros(3, device=device)
 
         for _ in range(warmup_steps):
             _set_base_velocity_command(env, env0_id, env0_cmd.unsqueeze(0))
             _set_base_velocity_command(env, rollout_env_ids, warmup_cmds)
 
+            _freeze_reference_robot(
+                robot,
+                ref_env_id,
+                ref_root_state,
+                ref_joint_pos,
+                ref_joint_vel,
+            )
+
             fresh_obs = _get_fresh_obs(env, obs)
             warmup_actions = policy(fresh_obs)
 
+            # Keep the reference robot still.
+            warmup_actions[1] = 0.0
+
             obs, reward, terminated, truncated, info = env.step(warmup_actions)
+
+            _freeze_reference_robot(
+                robot,
+                ref_env_id,
+                ref_root_state,
+                ref_joint_pos,
+                ref_joint_vel,
+            )
 
         costs = torch.zeros(k_rollouts, device=device, dtype=torch.float32)
         noise = torch.randn((k_rollouts, horizon, 3), device=device) * sigma.view(1, 1, 3)
@@ -292,21 +345,44 @@ def main() -> None:
             cmd_residual_t = u_nom[t].unsqueeze(0) + noise[:, t]
             rollout_cmds = _clamp_commands(base_cmd.unsqueeze(0) + cmd_residual_t, cmd_limit)
 
+            # Keep the reference robot command at zero for visualization.
+            rollout_cmds[0] = torch.zeros(3, device=device)
+
             # Keep env0 on the current real command while rollouts explore.
             _set_base_velocity_command(env, env0_id, env0_cmd.unsqueeze(0))
             _set_base_velocity_command(env, rollout_env_ids, rollout_cmds)
+
+            _freeze_reference_robot(
+                robot,
+                ref_env_id,
+                ref_root_state,
+                ref_joint_pos,
+                ref_joint_vel,
+            )
 
             # Recompute observations after updating commands, then query the policy.
             fresh_obs = _get_fresh_obs(env, obs)
             actions = policy(fresh_obs)
 
+            # Keep the reference robot still.
+            actions[1] = 0.0
+
             obs, reward, terminated, truncated, info = env.step(actions)
 
-            base_vel = robot.data.root_state_w[1:1 + k_rollouts, 7:10]
-            base_pos = robot.data.root_state_w[1:1 + k_rollouts, 0:3]
-            projected_gravity = robot.data.projected_gravity_b[1:1 + k_rollouts]
-            joint_pos = robot.data.joint_pos[1:1 + k_rollouts]
-            joint_vel = robot.data.joint_vel[1:1 + k_rollouts]
+            _freeze_reference_robot(
+                robot,
+                ref_env_id,
+                ref_root_state,
+                ref_joint_pos,
+                ref_joint_vel,
+            )
+
+            # Skip env 1 from rollout scoring because it is the frozen reference robot.
+            base_vel = robot.data.root_state_w[2:1 + k_rollouts, 7:10]
+            base_pos = robot.data.root_state_w[2:1 + k_rollouts, 0:3]
+            projected_gravity = robot.data.projected_gravity_b[2:1 + k_rollouts]
+            joint_pos = robot.data.joint_pos[2:1 + k_rollouts]
+            joint_vel = robot.data.joint_vel[2:1 + k_rollouts]
 
             vx_error = (base_vel[:, 0] - base_cmd[0]) ** 2
             vy_cost = base_vel[:, 1] ** 2
@@ -315,15 +391,16 @@ def main() -> None:
             upright_cost = projected_gravity[:, 0] ** 2 + projected_gravity[:, 1] ** 2
             pose_cost = ((joint_pos - joint_pos_0.unsqueeze(0)) ** 2).sum(dim=1)
             vel_joint_cost = (joint_vel ** 2).sum(dim=1)
-            residual_cost = ((cmd_residual_t / cmd_limit.unsqueeze(0)) ** 2).sum(dim=1)
+            residual_cost = ((cmd_residual_t[1:] / cmd_limit.unsqueeze(0)) ** 2).sum(dim=1)
 
             fall_penalty = torch.where(base_pos[:, 2] < 0.22, 50.0, 0.0)
             tilt_penalty = torch.where(upright_cost > 0.04, 40.0, 0.0)
             done_penalty = 50.0 * (
-                terminated[1:1 + k_rollouts].float() + truncated[1:1 + k_rollouts].float()
+                terminated[2:1 + k_rollouts].float() + truncated[2:1 + k_rollouts].float()
             )
 
-            step_cost = (
+            # env 1 is frozen reference, so fill only costs[1:] from rollouts.
+            costs[1:] += (
                 12.0 * vx_error
                 + 10.0 * vy_cost
                 + 4.0 * wz_cost
@@ -337,7 +414,8 @@ def main() -> None:
                 + done_penalty
             )
 
-            costs += step_cost
+            # Make the reference env impossible to select as best rollout.
+            costs[0] = 1e9
 
         weights = torch.softmax(-costs / args.lambda_mppi, dim=0)
         delta = torch.einsum("k,khd->hd", weights, noise)
@@ -364,37 +442,71 @@ def main() -> None:
             env_ids=env0_id,
         )
 
-        # Apply the chosen command to env0 and let the lower-level policy generate actions.
+        _freeze_reference_robot(
+            robot,
+            ref_env_id,
+            ref_root_state,
+            ref_joint_pos,
+            ref_joint_vel,
+        )
+
+        # Apply the chosen command to env0.
         env0_cmd = _clamp_commands(base_cmd + u_nom[0], cmd_limit)
-        _set_base_velocity_command(env, env0_id, env0_cmd.unsqueeze(0))
-
-        # Keep rollout env commands equal to env0 during the real step so they remain benign.
         rollout_cmds_real = env0_cmd.unsqueeze(0).repeat(k_rollouts, 1)
-        _set_base_velocity_command(env, rollout_env_ids, rollout_cmds_real)
 
-        fresh_obs = _get_fresh_obs(env, obs)
-        real_actions = policy(fresh_obs)
+        # Keep the reference robot command at zero.
+        rollout_cmds_real[0] = torch.zeros(3, device=device)
 
-        obs, reward, terminated, truncated, info = env.step(real_actions)
+        # Hold the chosen MPPI command for several low-level policy steps before replanning.
+        for hold_idx in range(hold_steps):
+            _set_base_velocity_command(env, env0_id, env0_cmd.unsqueeze(0))
+            _set_base_velocity_command(env, rollout_env_ids, rollout_cmds_real)
 
-        base_vel0 = robot.data.root_state_w[0, 7:10]
-        base_pos0 = robot.data.root_state_w[0, 0:3]
-        proj_grav0 = robot.data.projected_gravity_b[0]
-        vel_err0 = base_vel0 - env0_cmd
+            _freeze_reference_robot(
+                robot,
+                ref_env_id,
+                ref_root_state,
+                ref_joint_pos,
+                ref_joint_vel,
+            )
 
-        print("env0 terminated:", bool(terminated[0].item()))
-        print("env0 truncated:", bool(truncated[0].item()))
-        print("env0 commanded vel:", env0_cmd.detach().cpu().numpy())
-        print("env0 actual vel:", base_vel0.detach().cpu().numpy())
-        print("env0 vel error:", vel_err0.detach().cpu().numpy())
-        print("env0 pos:", base_pos0.detach().cpu().numpy())
-        print("env0 projected gravity:", proj_grav0.detach().cpu().numpy())
+            fresh_obs = _get_fresh_obs(env, obs)
+            real_actions = policy(fresh_obs)
+
+            # Keep the reference robot still.
+            real_actions[1] = 0.0
+
+            obs, reward, terminated, truncated, info = env.step(real_actions)
+
+            _freeze_reference_robot(
+                robot,
+                ref_env_id,
+                ref_root_state,
+                ref_joint_pos,
+                ref_joint_vel,
+            )
+
+            if hold_idx == hold_steps - 1:
+                base_vel0 = robot.data.root_state_w[0, 7:10]
+                base_pos0 = robot.data.root_state_w[0, 0:3]
+                proj_grav0 = robot.data.projected_gravity_b[0]
+                vel_err0 = base_vel0 - env0_cmd
+                forward_disp0 = robot.data.root_state_w[0, 0] - ref_root_state[0]
+
+                print("env0 terminated:", bool(terminated[0].item()))
+                print("env0 truncated:", bool(truncated[0].item()))
+                print("env0 commanded vel:", env0_cmd.detach().cpu().numpy())
+                print("env0 actual vel:", base_vel0.detach().cpu().numpy())
+                print("env0 vel error:", vel_err0.detach().cpu().numpy())
+                print("env0 pos:", base_pos0.detach().cpu().numpy())
+                print("env0 projected gravity:", proj_grav0.detach().cpu().numpy())
+                print("env0 forward displacement from reference:", float(forward_disp0.item()))
 
         # Shift the nominal sequence and append zero residual at the tail.
         u_nom = torch.cat([u_nom[1:], torch.zeros_like(u_nom[:1])], dim=0)
 
         # Keep the residual command modest.
-        residual_limit = 0.15 * cmd_limit
+        residual_limit = 0.25 * cmd_limit
         u_nom = _clamp_commands(u_nom, residual_limit)
 
     env.close()
