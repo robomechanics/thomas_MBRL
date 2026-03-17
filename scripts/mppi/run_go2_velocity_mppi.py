@@ -12,19 +12,6 @@ if SOURCE_ROOT not in sys.path:
     sys.path.insert(0, SOURCE_ROOT)
 
 
-def get_policy_obs(obs):
-    """Extract the policy observation tensor from Isaac Lab env outputs."""
-    if isinstance(obs, dict):
-        if "policy" in obs:
-            return obs["policy"]
-        if "obs" in obs:
-            return obs["obs"]
-        # fall back to the first tensor value
-        first_key = next(iter(obs.keys()))
-        return obs[first_key]
-    return obs
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     AppLauncher.add_app_launcher_args(parser)
@@ -33,35 +20,14 @@ def main() -> None:
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
 
+    import thomas_MBRL  # noqa: F401
     import gymnasium as gym
     import torch
-    import thomas_MBRL  # noqa: F401
 
     from thomas_MBRL.envs.go2_velocity_env_cfg import ThomasGo2VelocityEnvCfg
 
-    # ------------------------------------------------------------------
-    # USER SETTINGS
-    # ------------------------------------------------------------------
-    device = "cuda"
     K = 64
-    K_test = 32
-    H_test = 20
-    sigma = 0.05
-    lam = 1.0
-    target_height = 0.32
-
-    # easier forward command for debugging
-    fixed_cmd = torch.tensor([0.2, 0.0, 0.0], device=device)
-
-    # CHANGE THIS to your exported TorchScript policy
-    POLICY_PATH = "/PATH/TO/exported/policy.pt"
-    # ------------------------------------------------------------------
-
-    if not os.path.exists(POLICY_PATH):
-        raise FileNotFoundError(
-            f"Policy file not found: {POLICY_PATH}\n"
-            "Point POLICY_PATH to your exported TorchScript policy.pt"
-        )
+    device = "cuda"
 
     cfg = ThomasGo2VelocityEnvCfg()
     cfg.scene.num_envs = 1 + K
@@ -70,40 +36,43 @@ def main() -> None:
     env = gym.make("Thomas-Go2-Velocity-v0", cfg=cfg)
     obs, _ = env.reset()
 
+    fixed_cmd = torch.tensor([0.2, 0.0, 0.0], device=device)
+
     robot = env.unwrapped.scene["robot"]
     print("Robot found.")
 
     action_dim = env.unwrapped.action_manager.total_action_dim
     print(f"Action dim: {action_dim}")
 
+    # MPPI settings
+    K_test = 32
+    H_test = 25
+    sigma = 0.12
+    lam = 1.0
+    target_height = 0.32
+
     env_ids_test = torch.arange(1, K_test + 1, device=device)
     env0_id = torch.tensor([0], device=device)
 
-    # residual nominal sequence, not full action sequence
     u_nom = torch.zeros((H_test, action_dim), device=device)
 
-    # load pretrained policy
-    policy = torch.jit.load(POLICY_PATH, map_location=device)
-    policy.eval()
-    print(f"Loaded pretrained policy from: {POLICY_PATH}")
-
-    print("Starting residual MPPI control...")
+    print("Starting continuous MPPI control...")
 
     for outer in range(100):
         print(f"\n=== MPPI iteration {outer + 1} ===")
 
-        # keep the command visualization consistent
+        # Keep command visualization consistent
         cmd_buf = env.unwrapped.command_manager.get_command("base_velocity")
         cmd_buf[:, 0] = fixed_cmd[0]
         cmd_buf[:, 1] = fixed_cmd[1]
         cmd_buf[:, 2] = fixed_cmd[2]
 
-        # snapshot env0 BEFORE rollout
+        # Snapshot env0 BEFORE rollout
         root_state_0 = robot.data.root_state_w[0].clone()
         joint_pos_0 = robot.data.joint_pos[0].clone()
         joint_vel_0 = robot.data.joint_vel[0].clone()
 
-        # clone env0 into rollout envs
+        # Clone env0 into rollout envs
         robot.write_root_pose_to_sim(
             root_state_0[:7].repeat(K_test, 1),
             env_ids=env_ids_test,
@@ -118,29 +87,15 @@ def main() -> None:
             env_ids=env_ids_test,
         )
 
-        # restore obs after cloning
-        obs = env.unwrapped._get_observations() if hasattr(env.unwrapped, "_get_observations") else obs
-
         costs = torch.zeros(K_test, device=device)
         noise = sigma * torch.randn((K_test, H_test, action_dim), device=device)
 
+        # Rollout phase
         for t in range(H_test):
-            obs_policy = get_policy_obs(obs)
-
-            with torch.no_grad():
-                base_actions = policy(obs_policy)
-
             actions = torch.zeros((1 + K, action_dim), device=device)
 
-            # rollout envs get pretrained action + MPPI residual
-            actions[1:1 + K_test] = (
-                base_actions[1:1 + K_test]
-                + u_nom[t].unsqueeze(0)
-                + noise[:, t]
-            )
-
-            # keep env0 neutral during rollout phase
-            actions[0] = 0.0
+            # rollout envs only
+            actions[1:1 + K_test] = u_nom[t] + noise[:, t]
 
             obs, reward, terminated, truncated, info = env.step(actions)
 
@@ -153,18 +108,18 @@ def main() -> None:
             vel_error = (base_vel[:, :2] - cmd_xy) ** 2
             height_error = (base_pos[:, 2] - target_height) ** 2
             upright_cost = projected_gravity[:, 0] ** 2 + projected_gravity[:, 1] ** 2
-            residual_cost = (u_nom[t].unsqueeze(0) + noise[:, t]).pow(2).sum(dim=1)
+            control_cost = (actions[1:1 + K_test] ** 2).sum(dim=1)
 
             step_cost = (
                 6.0 * vel_error.sum(dim=1)
                 + 0.3 * height_error
                 + 0.2 * upright_cost
-                + 0.001 * residual_cost
+                + 0.0001 * control_cost
             )
 
             costs += step_cost
 
-        # MPPI residual update
+        # MPPI update
         weights = torch.softmax(-costs / lam, dim=0)
         delta = torch.einsum("k,khd->hd", weights, noise)
         u_nom = u_nom + delta
@@ -175,7 +130,7 @@ def main() -> None:
         print(f"Best rollout cost: {best_cost}")
         print(f"Best rollout index: {best_idx}")
 
-        # restore env0 to PRE-ROLLOUT snapshot
+        # Restore env0 to PRE-ROLLOUT snapshot
         robot.write_root_pose_to_sim(
             root_state_0[:7].unsqueeze(0),
             env_ids=env0_id,
@@ -190,15 +145,9 @@ def main() -> None:
             env_ids=env0_id,
         )
 
-        # refresh observation after restore
-        obs = env.unwrapped._get_observations() if hasattr(env.unwrapped, "_get_observations") else obs
-        obs_policy = get_policy_obs(obs)
-
-        with torch.no_grad():
-            base_actions = policy(obs_policy)
-
+        # Apply chosen action to env0 only
         real_actions = torch.zeros((1 + K, action_dim), device=device)
-        real_actions[0] = base_actions[0] + u_nom[0]
+        real_actions[0] = u_nom[0]
 
         obs, reward, terminated, truncated, info = env.step(real_actions)
 
@@ -215,11 +164,11 @@ def main() -> None:
         print("env0 vel error xy:", vel_err0.detach().cpu().numpy())
         print("env0 pos:", base_pos0.detach().cpu().numpy())
         print("env0 projected gravity:", proj_grav0.detach().cpu().numpy())
-        print("Applied policy + MPPI residual to env0.")
+        print("Applied MPPI action to env0.")
 
-        # shift residual sequence
+        # Shift nominal sequence
         u_nom = torch.cat([u_nom[1:], torch.zeros_like(u_nom[:1])], dim=0)
-        u_nom = torch.clamp(u_nom, -0.25, 0.25)
+        u_nom = torch.clamp(u_nom, -0.7, 0.7)
 
     env.close()
     simulation_app.close()
