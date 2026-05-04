@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
@@ -12,9 +12,14 @@ a more user-friendly way.
 
 """Launch Isaac Sim Simulator first."""
 
+# Example Usage:
+# python scripts/skrl/play.py --task=Random-Agent-Unitree-Go2-Play-v0 --num_envs=16 --checkpoint=logs/skrl/go2_flat_ppo/2026-02-10_09-17-30_ppo_torch/checkpoints/best_agent.pt
+# python scripts/skrl/play.py --task=Random-Agent-Unitree-Go2-Play-v0 --num_envs=16 --checkpoint=logs/skrl/go2_flat_ppo/2026-03-18_11-18-16_ppo_torch/checkpoints/best_agent.pt
+
+
 import argparse
-import sys
 import os
+import sys
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 SOURCE_ROOT = os.path.join(PROJECT_ROOT, "source", "thomas_MBRL")
@@ -43,11 +48,11 @@ parser.add_argument(
 )
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
-parser.add_argument(
-    "--use_pretrained_checkpoint",
-    action="store_true",
-    help="Use the pre-trained checkpoint from Nucleus.",
-)
+# parser.add_argument(
+#     "--use_pretrained_checkpoint",
+#     action="store_true",
+#     help="Use the pre-trained checkpoint from Nucleus.",
+# )
 parser.add_argument(
     "--ml_framework",
     type=str,
@@ -59,7 +64,7 @@ parser.add_argument(
     "--algorithm",
     type=str,
     default="PPO",
-    choices=["AMP", "PPO", "IPPO", "MAPPO"],
+    choices=["AMP", "PPO", "SAC", "IPPO", "MAPPO"],
     help="The RL algorithm used for training the skrl agent.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
@@ -80,13 +85,12 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
-import gymnasium as gym
-import os
 import random
 import time
-import torch
 
+import gymnasium as gym
 import skrl
+import torch
 from packaging import version
 
 # check for minimum supported skrl version
@@ -112,8 +116,10 @@ from isaaclab.envs import (
 )
 from isaaclab.utils.dict import print_dict
 
-
 from isaaclab_rl.skrl import SkrlVecEnvWrapper
+# from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+
+# heckpoint import get_published_pretrained_checkpoint
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
@@ -159,12 +165,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
     # get checkpoint path
-    if args_cli.use_pretrained_checkpoint:
-        resume_path = get_published_pretrained_checkpoint("skrl", train_task_name)
-        if not resume_path:
-            print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
-            return
-    elif args_cli.checkpoint:
+    # if args_cli.use_pretrained_checkpoint:
+    #     resume_path = get_published_pretrained_checkpoint("skrl", train_task_name)
+    #     if not resume_path:
+    #         print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
+    #         return
+    if args_cli.checkpoint:
         resume_path = os.path.abspath(args_cli.checkpoint)
     else:
         resume_path = get_checkpoint_path(
@@ -208,6 +214,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     experiment_cfg["trainer"]["close_environment_at_exit"] = False
     experiment_cfg["agent"]["experiment"]["write_interval"] = 0  # don't log to TensorBoard
     experiment_cfg["agent"]["experiment"]["checkpoint_interval"] = 0  # don't generate checkpoints
+    experiment_cfg["agent"]["random_timesteps"] = 0  # don't do random exploration during play
     runner = Runner(env, experiment_cfg)
 
     print(f"[INFO] Loading model checkpoint from: {resume_path}")

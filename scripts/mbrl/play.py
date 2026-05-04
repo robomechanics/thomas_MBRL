@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Play or evaluate an MBRL checkpoint on the Go2 walking task."""
+
+import argparse
+import os
+import random
+import sys
+import time
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+SOURCE_ROOT = os.path.join(PROJECT_ROOT, "source", "thomas_MBRL")
+if SOURCE_ROOT not in sys.path:
+    sys.path.insert(0, SOURCE_ROOT)
+
+from isaaclab.app import AppLauncher
+
+parser = argparse.ArgumentParser(description="Play or evaluate an MBRL checkpoint on an Isaac Lab task.")
+parser.add_argument("--video", action="store_true", default=False, help="Record a rollout video.")
+parser.add_argument("--video_length", type=int, default=1000, help="Length of the recorded video in steps.")
+parser.add_argument(
+    "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
+)
+parser.add_argument("--num_envs", type=int, default=16, help="Number of environments to simulate.")
+parser.add_argument("--task", type=str, default=None, help="Name of the task to evaluate.")
+parser.add_argument("--checkpoint", type=str, required=True, help="Path to an MBRL checkpoint.")
+parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment.")
+parser.add_argument("--num_episodes", type=int, default=5, help="Number of completed episodes to evaluate.")
+parser.add_argument("--max_steps", type=int, default=4000, help="Maximum environment steps to run.")
+parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument("--command_x", type=float, default=None, help="Fixed forward velocity command in m/s.")
+parser.add_argument("--command_y", type=float, default=None, help="Fixed lateral velocity command in m/s.")
+parser.add_argument("--command_yaw", type=float, default=None, help="Fixed yaw velocity command in rad/s.")
+parser.add_argument(
+    "--wander",
+    action="store_true",
+    default=False,
+    help="Sample nonzero movement commands instead of using the play environment's standing/heading mix.",
+)
+AppLauncher.add_app_launcher_args(parser)
+args_cli = parser.parse_args()
+
+if args_cli.video:
+    args_cli.enable_cameras = True
+
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+import gymnasium as gym
+import numpy as np
+import torch
+
+import isaaclab_tasks  # noqa: F401
+from isaaclab_tasks.utils import parse_env_cfg
+
+import thomas_MBRL.tasks  # noqa: F401
+from thomas_MBRL.mbrl import DynamicsEnsemble, build_planner
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def flatten_obs(obs: object, device: torch.device) -> torch.Tensor:
+    if isinstance(obs, dict):
+        if "policy" in obs:
+            obs = obs["policy"]
+        elif "obs" in obs and isinstance(obs["obs"], dict) and "policy" in obs["obs"]:
+            obs = obs["obs"]["policy"]
+        else:
+            raise KeyError(f"Unsupported observation dictionary keys: {list(obs.keys())}")
+    if not isinstance(obs, torch.Tensor):
+        obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
+    return obs.float().view(obs.shape[0], -1)
+
+
+def to_tensor(x: object, device: torch.device) -> torch.Tensor:
+    if isinstance(x, torch.Tensor):
+        return x.to(device)
+    return torch.as_tensor(x, device=device)
+
+
+def get_action_bounds(action_space: gym.Space, device: torch.device, action_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    low = getattr(action_space, "low", None)
+    high = getattr(action_space, "high", None)
+    if low is None or high is None:
+        return -torch.ones(action_dim, device=device), torch.ones(action_dim, device=device)
+
+    low_t = torch.as_tensor(low, dtype=torch.float32, device=device)
+    high_t = torch.as_tensor(high, dtype=torch.float32, device=device)
+    if low_t.ndim > 1:
+        low_t = low_t[0]
+    if high_t.ndim > 1:
+        high_t = high_t[0]
+    low_t = low_t.view(-1)
+    high_t = high_t.view(-1)
+    low_t = torch.where(torch.isfinite(low_t), low_t, -torch.ones_like(low_t))
+    high_t = torch.where(torch.isfinite(high_t), high_t, torch.ones_like(high_t))
+    return low_t, high_t
+
+
+def infer_play_task(train_task: str | None) -> str:
+    if train_task == "Flat-Unitree-Go2-train-v0":
+        return "Random-Agent-Unitree-Go2-Play-v0"
+    return train_task or "Random-Agent-Unitree-Go2-Play-v0"
+
+
+def apply_fixed_velocity_command(env_cfg: object) -> None:
+    if not args_cli.wander and args_cli.command_x is None and args_cli.command_y is None and args_cli.command_yaw is None:
+        return
+
+    command_cfg = env_cfg.commands.base_velocity
+    if args_cli.wander:
+        command_cfg.ranges.lin_vel_x = (-0.8, 0.8)
+        command_cfg.ranges.lin_vel_y = (-0.4, 0.4)
+        command_cfg.ranges.ang_vel_z = (-0.8, 0.8)
+        command_cfg.resampling_time_range = (3.0, 5.0)
+    else:
+        command_cfg.ranges.lin_vel_x = (args_cli.command_x or 0.0, args_cli.command_x or 0.0)
+        command_cfg.ranges.lin_vel_y = (args_cli.command_y or 0.0, args_cli.command_y or 0.0)
+        command_cfg.ranges.ang_vel_z = (args_cli.command_yaw or 0.0, args_cli.command_yaw or 0.0)
+    command_cfg.heading_command = False
+    command_cfg.rel_heading_envs = 0.0
+    command_cfg.rel_standing_envs = 0.0
+    command_cfg.debug_vis = True
+
+
+def main() -> None:
+    checkpoint_path = os.path.abspath(args_cli.checkpoint)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint_args = checkpoint.get("args", {})
+
+    seed = args_cli.seed if args_cli.seed is not None else checkpoint_args.get("seed", 42)
+    set_seed(seed)
+
+    task_name = args_cli.task or infer_play_task(checkpoint_args.get("task"))
+    use_fabric = not (args_cli.disable_fabric or checkpoint_args.get("disable_fabric", False))
+
+    env_cfg = parse_env_cfg(
+        task_name,
+        device=args_cli.device,
+        num_envs=args_cli.num_envs,
+        use_fabric=use_fabric,
+    )
+    env_cfg.seed = seed
+    apply_fixed_velocity_command(env_cfg)
+
+    render_mode = "rgb_array" if args_cli.video else None
+    env = gym.make(task_name, cfg=env_cfg, render_mode=render_mode)
+
+    if args_cli.video:
+        run_dir = os.path.dirname(os.path.dirname(checkpoint_path))
+        video_folder = os.path.join(run_dir, "videos", "mbrl_play")
+        env = gym.wrappers.RecordVideo(
+            env,
+            video_folder=video_folder,
+            step_trigger=lambda step: step == 0,
+            video_length=args_cli.video_length,
+            disable_logger=True,
+        )
+        print(f"[INFO] Recording video to: {video_folder}")
+
+    device = torch.device(env.unwrapped.device)
+    obs, _ = env.reset()
+    obs = flatten_obs(obs, device)
+    action_shape = env.action_space.shape
+    action_dim = int(action_shape[-1]) if len(action_shape) > 0 else int(np.prod(action_shape))
+    action_low, action_high = get_action_bounds(env.action_space, device, action_dim)
+
+    model = DynamicsEnsemble(
+        obs_dim=obs.shape[-1],
+        action_dim=action_dim,
+        ensemble_size=checkpoint_args["ensemble_size"],
+        hidden_dim=checkpoint_args["hidden_dim"],
+        depth=checkpoint_args["model_depth"],
+    ).to(device)
+    model.load_state_dict(checkpoint["model"])
+    model.eval()
+
+    planner_name = checkpoint_args.get("planner", "mppi")
+    planner = build_planner(
+        planner_name=planner_name,
+        model=model,
+        action_low=action_low,
+        action_high=action_high,
+        horizon=checkpoint_args["horizon"],
+        candidates=checkpoint_args["candidates"],
+        elites=checkpoint_args.get("elites", 32),
+        iterations=checkpoint_args.get("planner_iterations", checkpoint_args.get("cem_iterations", 4)),
+        discount=checkpoint_args["discount"],
+        temperature=checkpoint_args.get("planner_temperature", 0.5),
+        lambda_=checkpoint_args.get("mppi_lambda", 1.0),
+    )
+
+    try:
+        dt = env.step_dt
+    except AttributeError:
+        dt = env.unwrapped.step_dt
+
+    completed_returns: list[float] = []
+    completed_lengths: list[float] = []
+    episode_returns = torch.zeros(obs.shape[0], dtype=torch.float32, device=device)
+    episode_lengths = torch.zeros(obs.shape[0], dtype=torch.float32, device=device)
+
+    print(f"[INFO] Loaded checkpoint: {checkpoint_path}")
+    print(f"[INFO] Evaluating task={task_name} num_envs={args_cli.num_envs} num_episodes={args_cli.num_episodes}")
+    print(f"[INFO] Planner={planner_name}")
+
+    steps = 0
+    while (
+        simulation_app is not None
+        and simulation_app.is_running()
+        and steps < args_cli.max_steps
+        and len(completed_returns) < args_cli.num_episodes
+    ):
+        start_time = time.time()
+
+        with torch.inference_mode():
+            actions = planner.plan(obs)
+            next_obs_raw, rewards, terminated, truncated, _ = env.step(actions)
+            next_obs = flatten_obs(next_obs_raw, device)
+            rewards = to_tensor(rewards, device).float().view(-1)
+            done = to_tensor(terminated, device).bool().view(-1) | to_tensor(truncated, device).bool().view(-1)
+
+            episode_returns += rewards
+            episode_lengths += 1
+
+            if done.any():
+                done_mask = done
+                done_returns = episode_returns[done_mask].detach().cpu().tolist()
+                done_lengths = episode_lengths[done_mask].detach().cpu().tolist()
+                completed_returns.extend(done_returns)
+                completed_lengths.extend(done_lengths)
+                episode_returns[done_mask] = 0.0
+                episode_lengths[done_mask] = 0.0
+
+            obs = next_obs
+            steps += 1
+
+        sleep_time = dt - (time.time() - start_time)
+        if args_cli.real_time and sleep_time > 0:
+            time.sleep(sleep_time)
+
+        if args_cli.video and steps >= args_cli.video_length:
+            break
+
+    eval_returns = completed_returns[: args_cli.num_episodes]
+    eval_lengths = completed_lengths[: args_cli.num_episodes]
+    print(f"[EVAL] steps={steps} completed_episodes={len(eval_returns)}")
+    if eval_returns:
+        print(
+            "[EVAL] "
+            f"mean_return={float(np.mean(eval_returns)):.3f} "
+            f"std_return={float(np.std(eval_returns)):.3f} "
+            f"mean_length={float(np.mean(eval_lengths)):.2f}"
+        )
+    else:
+        print("[EVAL] No episodes completed before the evaluation budget ended.")
+
+    env.close()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        if simulation_app is not None:
+            simulation_app.close()

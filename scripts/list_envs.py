@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
@@ -15,7 +15,22 @@ with `Isaac` in their name.
 
 """Launch Isaac Sim Simulator first."""
 
+import argparse
+import os
+import sys
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+SOURCE_ROOT = os.path.join(PROJECT_ROOT, "source", "thomas_MBRL")
+if SOURCE_ROOT not in sys.path:
+    sys.path.insert(0, SOURCE_ROOT)
+
 from isaaclab.app import AppLauncher
+
+# add argparse arguments
+parser = argparse.ArgumentParser(description="List Isaac Lab environments.")
+parser.add_argument("--keyword", type=str, default=None, help="Keyword to filter environments.")
+# parse the arguments
+args_cli = parser.parse_args()
 
 # launch omniverse app
 app_launcher = AppLauncher(headless=True)
@@ -44,7 +59,7 @@ def main():
     index = 0
     # acquire all Isaac environments names
     for task_spec in gym.registry.values():
-        if "Template-" in task_spec.id:
+        if args_cli.keyword is None or args_cli.keyword in task_spec.id:
             # add details to table
             table.add_row([index + 1, task_spec.id, task_spec.entry_point, task_spec.kwargs["env_cfg_entry_point"]])
             # increment count

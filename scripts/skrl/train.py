@@ -1,3 +1,5 @@
+
+
 # Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
 #
@@ -12,9 +14,13 @@ a more user-friendly way.
 
 """Launch Isaac Sim Simulator first."""
 
+# Example Script Usage:
+# python scripts/skrl/train.py --task=Random-Agent-Unitree-Go2-v0 --num_envs=4096 --headless
+
+
 import argparse
-import sys
 import os
+import sys
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 SOURCE_ROOT = os.path.join(PROJECT_ROOT, "source", "thomas_MBRL")
@@ -30,39 +36,24 @@ parser.add_argument("--video_length", type=int, default=200, help="Length of the
 parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
-parser.add_argument(
-    "--agent",
-    type=str,
-    default=None,
-    help=(
-        "Name of the RL agent configuration entry point. Defaults to None, in which case the argument "
-        "--algorithm is used to determine the default agent configuration entry point."
-    ),
-)
+parser.add_argument("--agent", type=str, default=None, help=("Name of the RL agent configuration entry point. Defaults to None, in which case the argument --algorithm is used to determine the default agent configuration entry point."),)
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
-parser.add_argument(
-    "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
-)
+parser.add_argument("--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes.")
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint to resume training.")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
+parser.add_argument("--ml_framework",type=str,default="torch",choices=["torch", "jax", "jax-numpy"],help="The ML framework used for training the skrl agent.",)
+parser.add_argument("--algorithm",type=str,default="PPO",choices=["AMP", "PPO", "SAC", "IPPO", "MAPPO"],help="The RL algorithm used for training the skrl agent.",)
+parser.add_argument("--command_x", type=float, default=None, help="Fixed forward velocity command in m/s.")
+parser.add_argument("--command_y", type=float, default=None, help="Fixed lateral velocity command in m/s.")
+parser.add_argument("--command_yaw", type=float, default=None, help="Fixed yaw velocity command in rad/s.")
 parser.add_argument(
-    "--ml_framework",
-    type=str,
-    default="torch",
-    choices=["torch", "jax", "jax-numpy"],
-    help="The ML framework used for training the skrl agent.",
+    "--wander",
+    action="store_true",
+    default=False,
+    help="Sample nonzero walking commands instead of the default heading-command mix.",
 )
-parser.add_argument(
-    "--algorithm",
-    type=str,
-    default="PPO",
-    choices=["AMP", "PPO", "IPPO", "MAPPO"],
-    help="The RL algorithm used for training the skrl agent.",
-)
-parser.add_argument(
-    "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
-)
+
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -81,13 +72,14 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import gymnasium as gym
-import logging
-import os
 import random
 from datetime import datetime
 
+import omni
 import skrl
 from packaging import version
+
+import thomas_MBRL # noqa: F401
 
 # check for minimum supported skrl version
 SKRL_VERSION = "1.4.3"
@@ -103,13 +95,7 @@ if args_cli.ml_framework.startswith("torch"):
 elif args_cli.ml_framework.startswith("jax"):
     from skrl.utils.runner.jax import Runner
 
-from isaaclab.envs import (
-    DirectMARLEnv,
-    DirectMARLEnvCfg,
-    DirectRLEnvCfg,
-    ManagerBasedRLEnvCfg,
-    multi_agent_to_single_agent,
-)
+from isaaclab.envs import (DirectMARLEnv, DirectMARLEnvCfg, DirectRLEnvCfg, ManagerBasedRLEnvCfg, multi_agent_to_single_agent)
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
@@ -119,10 +105,7 @@ from isaaclab_rl.skrl import SkrlVecEnvWrapper
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
-# import logger
-logger = logging.getLogger(__name__)
 
-import thomas_MBRL.tasks  # noqa: F401
 
 # config shortcuts
 if args_cli.agent is None:
@@ -139,6 +122,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    apply_velocity_command_overrides(env_cfg)
 
     # check for invalid combination of CPU device with distributed training
     if args_cli.distributed and args_cli.device is not None and "cpu" in args_cli.device:
@@ -152,7 +136,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"
     # max iterations for training
     if args_cli.max_iterations:
-        agent_cfg["trainer"]["timesteps"] = args_cli.max_iterations * agent_cfg["agent"]["rollouts"]
+        rollouts = agent_cfg["agent"].get("rollouts")
+        agent_cfg["trainer"]["timesteps"] = args_cli.max_iterations * rollouts if rollouts else args_cli.max_iterations
     agent_cfg["trainer"]["close_environment_at_exit"] = False
     # configure the ML framework into the global skrl variable
     if args_cli.ml_framework.startswith("jax"):
@@ -190,11 +175,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # get checkpoint path (to resume training)
     resume_path = retrieve_file_path(args_cli.checkpoint) if args_cli.checkpoint else None
 
-    # set the IO descriptors export flag if requested
+    # set the IO descriptors output directory if requested
     if isinstance(env_cfg, ManagerBasedRLEnvCfg):
         env_cfg.export_io_descriptors = args_cli.export_io_descriptors
+        env_cfg.io_descriptors_output_dir = os.path.join(log_root_path, log_dir)
     else:
-        logger.warning(
+        omni.log.warn(
             "IO descriptors are only supported for manager based RL environments. No IO descriptors will be exported."
         )
 
@@ -203,6 +189,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+
+    # Off-policy algorithms such as SAC sample random actions during exploration.
+    # ManagerBasedRLEnv exposes unbounded action spaces, so clamp them before skrl wraps the env.
+    action_clip = agent_cfg.get("action_clip", None)
+    if action_clip is not None:
+        import numpy as np
+
+        clip_val = float(action_clip)
+        unwrapped = env.unwrapped
+        single_shape = (
+            unwrapped.single_action_space.shape
+            if hasattr(unwrapped, "single_action_space")
+            else unwrapped.action_space.shape
+        )
+        bounded_space = gym.spaces.Box(low=-clip_val, high=clip_val, shape=single_shape, dtype=np.float32)
+        unwrapped.single_action_space = bounded_space
+        unwrapped.action_space = bounded_space
+        print(f"[INFO] Action space overridden to [-{clip_val}, {clip_val}]: {bounded_space}")
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv) and algorithm in ["ppo"]:
@@ -232,11 +236,36 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO] Loading model checkpoint from: {resume_path}")
         runner.agent.load(resume_path)
 
+
     # run training
     runner.run()
 
     # close the simulator
     env.close()
+
+
+def apply_velocity_command_overrides(env_cfg: object) -> None:
+    if not args_cli.wander and args_cli.command_x is None and args_cli.command_y is None and args_cli.command_yaw is None:
+        return
+
+    commands = getattr(env_cfg, "commands", None)
+    command_cfg = getattr(commands, "base_velocity", None)
+    if command_cfg is None:
+        raise AttributeError("This task config does not expose commands.base_velocity")
+
+    if args_cli.wander:
+        command_cfg.ranges.lin_vel_x = (-0.8, 0.8)
+        command_cfg.ranges.lin_vel_y = (-0.4, 0.4)
+        command_cfg.ranges.ang_vel_z = (-0.8, 0.8)
+        command_cfg.resampling_time_range = (3.0, 5.0)
+    else:
+        command_cfg.ranges.lin_vel_x = (args_cli.command_x or 0.0, args_cli.command_x or 0.0)
+        command_cfg.ranges.lin_vel_y = (args_cli.command_y or 0.0, args_cli.command_y or 0.0)
+        command_cfg.ranges.ang_vel_z = (args_cli.command_yaw or 0.0, args_cli.command_yaw or 0.0)
+
+    command_cfg.heading_command = False
+    command_cfg.rel_heading_envs = 0.0
+    command_cfg.rel_standing_envs = 0.0
 
 
 if __name__ == "__main__":

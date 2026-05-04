@@ -15,7 +15,7 @@ models:
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [32, 32]
+        layers: [128, 128, 128]
         activations: elu
     output: ACTIONS
   value:  # see deterministic_model parameters
@@ -24,7 +24,7 @@ models:
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [32, 32]
+        layers: [128, 128, 128]
         activations: elu
     output: ONE
 
@@ -40,12 +40,12 @@ memory:
 # https://skrl.readthedocs.io/en/latest/api/agents/ppo.html
 agent:
   class: PPO
-  rollouts: 32
-  learning_epochs: 8
-  mini_batches: 8
+  rollouts: 24                 # Short rollouts are critical for parallel physical sims (Isaac)
+  learning_epochs: 5           # Standard for legged locomotion
+  mini_batches: 4
   discount_factor: 0.99
   lambda: 0.95
-  learning_rate: 0 # ZERO FOR RANDOM AGENT - No update # 5.0e-04
+  learning_rate: 1.0e-3        # Higher initial LR works well with Adaptive Scheduler
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
     kl_threshold: 0.008
@@ -59,18 +59,17 @@ agent:
   ratio_clip: 0.2
   value_clip: 0.2
   clip_predicted_values: True
-  entropy_loss_scale: 0.0
-  value_loss_scale: 2.0
+  entropy_loss_scale: 0.01     # Increased from 0.0 to prevent premature convergence
+  value_loss_scale: 1.0
   kl_threshold: 0.0
-  rewards_shaper_scale: 0.1
+  rewards_shaper_scale: 1.0    # Set to 1.0; usually environments handle their own scaling
   time_limit_bootstrap: False
   # logging and checkpoint
   experiment:
-    directory: "cartpole_direct"
+    directory: "go2_flat_ppo"
     experiment_name: ""
-    write_interval: auto
-    checkpoint_interval: auto
-
+    write_interval: 100
+    checkpoint_interval: 2000
 
 # Sequential trainer
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
