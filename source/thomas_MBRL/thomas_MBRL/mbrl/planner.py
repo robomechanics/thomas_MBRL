@@ -17,6 +17,7 @@ class TrajectoryPlanner:
         candidates: int = 512,
         discount: float = 0.99,
         temperature: float = 0.5,
+        action_spline_knots: int = 0,
     ):
         self.model = model
         self.action_low = action_low
@@ -26,17 +27,64 @@ class TrajectoryPlanner:
         self.discount = discount
         self.temperature = temperature
         self.action_dim = action_low.numel()
+        self.action_spline_knots = action_spline_knots if 1 < action_spline_knots < horizon else 0
         self._prev_mean: torch.Tensor | None = None
+
+    @property
+    def control_horizon(self) -> int:
+        return self.action_spline_knots or self.horizon
 
     def _warm_start_mean(self, obs: torch.Tensor) -> torch.Tensor:
         batch_size = obs.shape[0]
-        shape = (batch_size, self.horizon, self.action_dim)
+        shape = (batch_size, self.control_horizon, self.action_dim)
         if self._prev_mean is None or self._prev_mean.shape != shape or self._prev_mean.device != obs.device:
             return torch.zeros(shape, device=obs.device, dtype=obs.dtype)
 
-        shifted = torch.zeros_like(self._prev_mean)
-        shifted[:, :-1, :] = self._prev_mean[:, 1:, :]
-        return shifted
+        if not self.action_spline_knots:
+            shifted = torch.zeros_like(self._prev_mean)
+            shifted[:, :-1, :] = self._prev_mean[:, 1:, :]
+            return shifted
+
+        shifted_actions = torch.zeros((batch_size, self.horizon, self.action_dim), device=obs.device, dtype=obs.dtype)
+        previous_actions = self._interpolate_action_spline(self._prev_mean)
+        shifted_actions[:, :-1, :] = previous_actions[:, 1:, :]
+        return self._sample_actions_at_knots(shifted_actions)
+
+    def _sample_actions_at_knots(self, action_sequences: torch.Tensor) -> torch.Tensor:
+        knot_positions = torch.linspace(0, self.horizon - 1, self.control_horizon, device=action_sequences.device)
+        knot_indices = knot_positions.round().long().clamp_(0, self.horizon - 1)
+        return action_sequences[:, knot_indices, :]
+
+    def _interpolate_action_spline(self, action_knots: torch.Tensor) -> torch.Tensor:
+        """Expand uniformly spaced action knots with cubic Catmull-Rom interpolation."""
+        knot_count = action_knots.shape[-2]
+        if knot_count == self.horizon:
+            return action_knots
+
+        positions = torch.linspace(0, knot_count - 1, self.horizon, device=action_knots.device)
+        left = positions.floor().long().clamp_(0, knot_count - 1)
+        right = (left + 1).clamp_(0, knot_count - 1)
+        before = (left - 1).clamp_(0, knot_count - 1)
+        after = (right + 1).clamp_(0, knot_count - 1)
+        frac = (positions - left.to(positions.dtype)).view(*([1] * (action_knots.ndim - 2)), self.horizon, 1)
+
+        p0 = action_knots[..., before, :]
+        p1 = action_knots[..., left, :]
+        p2 = action_knots[..., right, :]
+        p3 = action_knots[..., after, :]
+        frac2 = frac.square()
+        frac3 = frac2 * frac
+        return 0.5 * (
+            (2.0 * p1)
+            + (-p0 + p2) * frac
+            + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * frac2
+            + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * frac3
+        )
+
+    def _expand_controls(self, controls: torch.Tensor) -> torch.Tensor:
+        if not self.action_spline_knots:
+            return controls
+        return self._interpolate_action_spline(controls)
 
     def _clip_action_sequences(self, action_sequences: torch.Tensor) -> torch.Tensor:
         return torch.max(
@@ -79,6 +127,7 @@ class CEMPlanner(TrajectoryPlanner):
         iterations: int = 5,
         discount: float = 0.99,
         temperature: float = 0.5,
+        action_spline_knots: int = 0,
     ):
         super().__init__(
             model=model,
@@ -88,6 +137,7 @@ class CEMPlanner(TrajectoryPlanner):
             candidates=candidates,
             discount=discount,
             temperature=temperature,
+            action_spline_knots=action_spline_knots,
         )
         self.elites = elites
         self.iterations = iterations
@@ -98,20 +148,24 @@ class CEMPlanner(TrajectoryPlanner):
 
         for _ in range(self.iterations):
             noise = torch.randn(
-                (obs.shape[0], self.candidates, self.horizon, self.action_dim), device=obs.device, dtype=obs.dtype
+                (obs.shape[0], self.candidates, self.control_horizon, self.action_dim),
+                device=obs.device,
+                dtype=obs.dtype,
             )
-            action_sequences = self._clip_action_sequences(mean.unsqueeze(1) + std.unsqueeze(1) * noise)
+            controls = mean.unsqueeze(1) + std.unsqueeze(1) * noise
+            action_sequences = self._clip_action_sequences(self._expand_controls(controls))
 
             returns = self.evaluate_sequences(obs, action_sequences)
             elite_indices = returns.topk(self.elites, dim=1).indices
-            elite_actions = action_sequences.gather(
-                1, elite_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.horizon, self.action_dim)
+            elite_controls = controls.gather(
+                1, elite_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.control_horizon, self.action_dim)
             )
-            mean = elite_actions.mean(dim=1)
-            std = elite_actions.std(dim=1).clamp_min(1e-3)
+            mean = elite_controls.mean(dim=1)
+            std = elite_controls.std(dim=1).clamp_min(1e-3)
 
         self._prev_mean = mean.detach()
-        return mean[:, 0, :]
+        actions = self._clip_action_sequences(self._expand_controls(mean).unsqueeze(1)).squeeze(1)
+        return actions[:, 0, :]
 
 
 class MPPIPlanner(TrajectoryPlanner):
@@ -128,6 +182,7 @@ class MPPIPlanner(TrajectoryPlanner):
         discount: float = 0.99,
         temperature: float = 0.5,
         lambda_: float = 1.0,
+        action_spline_knots: int = 0,
     ):
         super().__init__(
             model=model,
@@ -137,6 +192,7 @@ class MPPIPlanner(TrajectoryPlanner):
             candidates=candidates,
             discount=discount,
             temperature=temperature,
+            action_spline_knots=action_spline_knots,
         )
         self.iterations = iterations
         self.lambda_ = lambda_
@@ -147,20 +203,24 @@ class MPPIPlanner(TrajectoryPlanner):
 
         for _ in range(self.iterations):
             noise = torch.randn(
-                (obs.shape[0], self.candidates, self.horizon, self.action_dim), device=obs.device, dtype=obs.dtype
+                (obs.shape[0], self.candidates, self.control_horizon, self.action_dim),
+                device=obs.device,
+                dtype=obs.dtype,
             )
-            action_sequences = self._clip_action_sequences(mean.unsqueeze(1) + std.unsqueeze(1) * noise)
+            controls = mean.unsqueeze(1) + std.unsqueeze(1) * noise
+            action_sequences = self._clip_action_sequences(self._expand_controls(controls))
             returns = self.evaluate_sequences(obs, action_sequences)
 
             shifted_returns = returns - returns.max(dim=1, keepdim=True).values
             weights = torch.softmax(shifted_returns / max(self.lambda_, 1e-6), dim=1)
-            mean = (weights.unsqueeze(-1).unsqueeze(-1) * action_sequences).sum(dim=1)
-            centered = action_sequences - mean.unsqueeze(1)
+            mean = (weights.unsqueeze(-1).unsqueeze(-1) * controls).sum(dim=1)
+            centered = controls - mean.unsqueeze(1)
             variance = (weights.unsqueeze(-1).unsqueeze(-1) * centered.square()).sum(dim=1)
             std = variance.sqrt().clamp_min(1e-3)
 
         self._prev_mean = mean.detach()
-        return mean[:, 0, :]
+        actions = self._clip_action_sequences(self._expand_controls(mean).unsqueeze(1)).squeeze(1)
+        return actions[:, 0, :]
 
 
 def build_planner(
@@ -175,6 +235,7 @@ def build_planner(
     discount: float,
     temperature: float,
     lambda_: float,
+    action_spline_knots: int = 0,
 ) -> TrajectoryPlanner:
     if planner_name == "mppi":
         return MPPIPlanner(
@@ -187,6 +248,7 @@ def build_planner(
             discount=discount,
             temperature=temperature,
             lambda_=lambda_,
+            action_spline_knots=action_spline_knots,
         )
     if planner_name == "cem":
         return CEMPlanner(
@@ -199,5 +261,6 @@ def build_planner(
             iterations=iterations,
             discount=discount,
             temperature=temperature,
+            action_spline_knots=action_spline_knots,
         )
     raise ValueError(f"Unsupported planner: {planner_name}")

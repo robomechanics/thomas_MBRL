@@ -12,7 +12,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = PROJECT_ROOT / "source" / "thomas_MBRL"
 DEFAULT_METHODS = ("ppo", "sac", "mbrl")
@@ -33,7 +32,7 @@ PRESETS = {
         "mbrl_updates_per_step": 8,
     },
     "full": {
-        "budget_steps": 200000,
+        "budget_steps": 50000,
         "num_envs": 4096,
         "mbrl_num_envs": 64,
         "mbrl_seed_steps": 500,

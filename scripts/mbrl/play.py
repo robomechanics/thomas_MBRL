@@ -199,6 +199,7 @@ def main() -> None:
         discount=checkpoint_args["discount"],
         temperature=checkpoint_args.get("planner_temperature", 0.5),
         lambda_=checkpoint_args.get("mppi_lambda", 1.0),
+        action_spline_knots=checkpoint_args.get("action_spline_knots", 0),
     )
 
     try:

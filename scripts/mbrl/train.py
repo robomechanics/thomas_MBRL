@@ -42,6 +42,12 @@ parser.add_argument("--planner_iterations", type=int, default=5, help="Planner r
 parser.add_argument("--discount", type=float, default=0.99, help="Planning discount factor.")
 parser.add_argument("--planner_temperature", type=float, default=0.35, help="Initial planner exploration scale.")
 parser.add_argument("--mppi_lambda", type=float, default=1.0, help="MPPI reward temperature.")
+parser.add_argument(
+    "--action_spline_knots",
+    type=int,
+    default=0,
+    help="Sample this many cubic action-spline knots instead of one action per horizon step. Disabled when <=1.",
+)
 parser.add_argument("--lr", type=float, default=3e-4, help="Dynamics model learning rate.")
 parser.add_argument("--eval_interval", type=int, default=10, help="Steps between console/log summaries.")
 parser.add_argument("--save_interval", type=int, default=50, help="Steps between checkpoints.")
@@ -238,6 +244,7 @@ def main() -> None:
         discount=args_cli.discount,
         temperature=args_cli.planner_temperature,
         lambda_=args_cli.mppi_lambda,
+        action_spline_knots=args_cli.action_spline_knots,
     )
 
     train_state = TrainState()
