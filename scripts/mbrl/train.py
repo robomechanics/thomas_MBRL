@@ -28,6 +28,30 @@ parser.add_argument("--task", type=str, default="Flat-Unitree-Go2-train-v0", hel
 parser.add_argument("--seed", type=int, default=42, help="Seed used for training.")
 parser.add_argument("--buffer_capacity", type=int, default=300000, help="Replay buffer capacity.")
 parser.add_argument("--seed_steps", type=int, default=50, help="Initial random environment steps before planning.")
+parser.add_argument(
+    "--planner_start_steps",
+    type=int,
+    default=None,
+    help="Earliest step at which residual planning may control the env. Defaults to --seed_steps.",
+)
+parser.add_argument(
+    "--planner_min_length_fraction",
+    type=float,
+    default=0.9,
+    help="Require recent completed episodes to reach this fraction of max length before enabling the planner.",
+)
+parser.add_argument(
+    "--planner_recovery_steps",
+    type=int,
+    default=1000,
+    help="Number of pure-prior recovery steps after planner-controlled episodes get too short.",
+)
+parser.add_argument(
+    "--planner_recent_episodes",
+    type=int,
+    default=100,
+    help="Number of recent completed episodes used for planner gating.",
+)
 parser.add_argument("--train_steps", type=int, default=400, help="Number of environment interaction steps.")
 parser.add_argument("--updates_per_step", type=int, default=8, help="Model updates after each environment step.")
 parser.add_argument("--batch_size", type=int, default=4096, help="Replay batch size.")
@@ -61,6 +85,18 @@ parser.add_argument(
 parser.add_argument("--seed_policy_noise", type=float, default=0.05, help="Gaussian action noise added to prior seed actions.")
 parser.add_argument("--prior_residual_scale", type=float, default=0.25, help="Max residual action magnitude around the prior.")
 parser.add_argument("--prior_residual_penalty", type=float, default=0.0, help="Planning penalty on squared residual actions.")
+parser.add_argument(
+    "--prior_fallback",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Fall back to the pure prior unless the residual plan improves predicted return.",
+)
+parser.add_argument(
+    "--prior_acceptance_margin",
+    type=float,
+    default=0.0,
+    help="Required predicted-return improvement before using residual actions over the pure prior.",
+)
 parser.add_argument("--lr", type=float, default=3e-4, help="Dynamics model learning rate.")
 parser.add_argument("--eval_interval", type=int, default=10, help="Steps between console/log summaries.")
 parser.add_argument("--save_interval", type=int, default=50, help="Steps between checkpoints.")
@@ -149,11 +185,11 @@ def to_tensor(x: object, device: torch.device) -> torch.Tensor:
     return torch.as_tensor(x, device=device)
 
 
-def get_action_bounds(action_space: gym.Space, device: torch.device, action_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+def get_action_bounds(action_space: gym.Space, device: torch.device, action_dim: int) -> tuple[torch.Tensor, torch.Tensor, bool]:
     low = getattr(action_space, "low", None)
     high = getattr(action_space, "high", None)
     if low is None or high is None:
-        return -torch.ones(action_dim, device=device), torch.ones(action_dim, device=device)
+        return -torch.ones(action_dim, device=device), torch.ones(action_dim, device=device), False
 
     low_t = torch.as_tensor(low, dtype=torch.float32, device=device)
     high_t = torch.as_tensor(high, dtype=torch.float32, device=device)
@@ -163,9 +199,10 @@ def get_action_bounds(action_space: gym.Space, device: torch.device, action_dim:
         high_t = high_t[0]
     low_t = low_t.view(-1)
     high_t = high_t.view(-1)
+    bounds_finite = bool(torch.isfinite(low_t).all().item() and torch.isfinite(high_t).all().item())
     low_t = torch.where(torch.isfinite(low_t), low_t, -torch.ones_like(low_t))
     high_t = torch.where(torch.isfinite(high_t), high_t, torch.ones_like(high_t))
-    return low_t, high_t
+    return low_t, high_t, bounds_finite
 
 
 def random_actions(batch_size: int, action_low: torch.Tensor, action_high: torch.Tensor) -> torch.Tensor:
@@ -278,7 +315,8 @@ def main() -> None:
     action_dim = int(action_shape[-1]) if len(action_shape) > 0 else int(np.prod(action_shape))
     obs_dim = obs.shape[-1]
 
-    action_low, action_high = get_action_bounds(env.action_space, device, action_dim)
+    action_low, action_high, action_bounds_finite = get_action_bounds(env.action_space, device, action_dim)
+    setattr(args_cli, "action_bounds_finite", action_bounds_finite)
     action_prior = None
     if args_cli.prior_checkpoint:
         action_prior = SkrlPolicyPrior(
@@ -316,6 +354,9 @@ def main() -> None:
         action_prior=action_prior,
         prior_residual_scale=args_cli.prior_residual_scale,
         prior_residual_penalty=args_cli.prior_residual_penalty,
+        prior_acceptance_margin=args_cli.prior_acceptance_margin,
+        prior_fallback=args_cli.prior_fallback,
+        action_bounds_finite=action_bounds_finite,
     )
 
     train_state = TrainState()
@@ -329,6 +370,10 @@ def main() -> None:
     early_stop_best_metric = float("-inf")
     early_stop_best_step = 0
     early_stop_reason: str | None = None
+    planner_disabled_until = 0
+    planner_start_steps = args_cli.planner_start_steps if args_cli.planner_start_steps is not None else args_cli.seed_steps
+    planner_min_length = args_cli.planner_min_length_fraction * episode_horizon_steps
+    planner_active = False
 
     with open(os.path.join(log_dir, "config.txt"), "w", encoding="utf-8") as f:
         for key, value in sorted(vars(args_cli).items()):
@@ -339,12 +384,24 @@ def main() -> None:
 
     while app_is_running() and train_state.env_steps < args_cli.train_steps:
         with torch.inference_mode():
-            if train_state.env_steps < args_cli.seed_steps or len(replay) < args_cli.batch_size:
+            recent_length_window = recent_lengths[-args_cli.planner_recent_episodes :]
+            recent_mean_length = float(np.mean(recent_length_window)) if recent_length_window else 0.0
+            prior_policy_available = action_prior is not None and args_cli.seed_with_prior
+            planner_ready = (
+                train_state.env_steps >= planner_start_steps
+                and len(replay) >= args_cli.batch_size
+                and (not prior_policy_available or recent_mean_length >= planner_min_length)
+                and train_state.env_steps >= planner_disabled_until
+            )
+            planner_active = planner_ready
+
+            if not planner_ready:
                 if action_prior is not None and args_cli.seed_with_prior:
                     actions = action_prior(obs)
                     if args_cli.seed_policy_noise > 0.0:
                         actions = actions + args_cli.seed_policy_noise * torch.randn_like(actions)
-                    actions = clip_actions(actions, action_low, action_high)
+                    if action_bounds_finite:
+                        actions = clip_actions(actions, action_low, action_high)
                 else:
                     actions = random_actions(obs.shape[0], action_low, action_high)
             else:
@@ -376,6 +433,16 @@ def main() -> None:
                 train_state.episodes_finished += int(done_mask.sum().item())
                 episode_returns[done_mask] = 0.0
                 episode_lengths[done_mask] = 0.0
+                planner.reset(done_mask)
+                if planner_active:
+                    recent_length_window = recent_lengths[-args_cli.planner_recent_episodes :]
+                    recent_mean_length = float(np.mean(recent_length_window)) if recent_length_window else 0.0
+                    if recent_mean_length < planner_min_length:
+                        planner_disabled_until = max(
+                            planner_disabled_until,
+                            train_state.env_steps + args_cli.planner_recovery_steps,
+                        )
+                        planner.reset()
 
             obs = next_obs
             train_state.env_steps += 1
@@ -417,6 +484,9 @@ def main() -> None:
                 "current_return_mean": current_return_mean,
                 "current_length_mean": current_length_mean,
                 "best_mean_return": train_state.best_mean_return,
+                "planner_active": int(planner_active),
+                "planner_disabled_until": planner_disabled_until,
+                "action_bounds_finite": int(action_bounds_finite),
                 **latest_losses,
             }
             append_metrics(metrics_path, row)
@@ -429,6 +499,9 @@ def main() -> None:
             writer.add_scalar("Train / gradient_updates", train_state.gradient_updates, train_state.env_steps)
             writer.add_scalar("Train / buffer_size", len(replay), train_state.env_steps)
             writer.add_scalar("Train / episodes_finished", train_state.episodes_finished, train_state.env_steps)
+            writer.add_scalar("Train / planner_active", int(planner_active), train_state.env_steps)
+            writer.add_scalar("Train / planner_disabled_until", planner_disabled_until, train_state.env_steps)
+            writer.add_scalar("Train / action_bounds_finite", int(action_bounds_finite), train_state.env_steps)
             for loss_name, loss_value in latest_losses.items():
                 writer.add_scalar(f"Loss / {loss_name}", loss_value, train_state.env_steps)
             writer.flush()
@@ -441,6 +514,7 @@ def main() -> None:
                 f"estimated_return100={estimated_return_100:.3f} "
                 f"step_reward100={mean_step_reward_100:.3f} "
                 f"len100={mean_length:.2f} "
+                f"planner={'on' if planner_active else 'prior'} "
                 f"loss={latest_losses['loss']:.4f} "
                 f"elapsed={format_duration(elapsed_s)} "
                 f"eta={format_duration(eta_s)}"

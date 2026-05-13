@@ -3,6 +3,10 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import math
+
+import isaaclab.envs.mdp as base_mdp
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 
 from .rough_env_cfg import UnitreeGo2RoughEnvCfg
@@ -31,6 +35,14 @@ class UnitreeGo2RandFlatEnvCfg(UnitreeGo2RoughEnvCfg):
         self.rewards.feet_air_time = None
         self.rewards.undesired_contacts = None
         self.terminations.base_contact = None
+        self.terminations.base_height = DoneTerm(
+            func=base_mdp.root_height_below_minimum,
+            params={"minimum_height": 0.18},
+        )
+        self.terminations.bad_orientation = DoneTerm(
+            func=base_mdp.bad_orientation,
+            params={"limit_angle": math.radians(60.0)},
+        )
         # no height scan
         self.scene.height_scanner = None
         self.observations.policy.height_scan = None

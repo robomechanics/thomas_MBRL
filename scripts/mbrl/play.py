@@ -43,6 +43,18 @@ parser.add_argument("--prior_agent", type=str, default=None, help="Override skrl
 parser.add_argument("--prior_only", action="store_true", default=False, help="Run the locomotion prior without MBRL/MPPI.")
 parser.add_argument("--prior_residual_scale", type=float, default=None, help="Override residual scale around the prior.")
 parser.add_argument("--prior_residual_penalty", type=float, default=None, help="Override residual penalty around the prior.")
+parser.add_argument(
+    "--prior_fallback",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help="Override fallback to the pure prior unless the residual plan improves predicted return.",
+)
+parser.add_argument(
+    "--prior_acceptance_margin",
+    type=float,
+    default=None,
+    help="Override required predicted-return improvement before using residual actions.",
+)
 parser.add_argument("--debug_actions", action="store_true", default=False, help="Print action and velocity-command stats.")
 parser.add_argument(
     "--wander",
@@ -97,11 +109,11 @@ def to_tensor(x: object, device: torch.device) -> torch.Tensor:
     return torch.as_tensor(x, device=device)
 
 
-def get_action_bounds(action_space: gym.Space, device: torch.device, action_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+def get_action_bounds(action_space: gym.Space, device: torch.device, action_dim: int) -> tuple[torch.Tensor, torch.Tensor, bool]:
     low = getattr(action_space, "low", None)
     high = getattr(action_space, "high", None)
     if low is None or high is None:
-        return -torch.ones(action_dim, device=device), torch.ones(action_dim, device=device)
+        return -torch.ones(action_dim, device=device), torch.ones(action_dim, device=device), False
 
     low_t = torch.as_tensor(low, dtype=torch.float32, device=device)
     high_t = torch.as_tensor(high, dtype=torch.float32, device=device)
@@ -111,9 +123,10 @@ def get_action_bounds(action_space: gym.Space, device: torch.device, action_dim:
         high_t = high_t[0]
     low_t = low_t.view(-1)
     high_t = high_t.view(-1)
+    bounds_finite = bool(torch.isfinite(low_t).all().item() and torch.isfinite(high_t).all().item())
     low_t = torch.where(torch.isfinite(low_t), low_t, -torch.ones_like(low_t))
     high_t = torch.where(torch.isfinite(high_t), high_t, torch.ones_like(high_t))
-    return low_t, high_t
+    return low_t, high_t, bounds_finite
 
 
 def infer_play_task(train_task: str | None) -> str:
@@ -195,7 +208,7 @@ def main() -> None:
     obs = flatten_obs(obs, device)
     action_shape = env.action_space.shape
     action_dim = int(action_shape[-1]) if len(action_shape) > 0 else int(np.prod(action_shape))
-    action_low, action_high = get_action_bounds(env.action_space, device, action_dim)
+    action_low, action_high, action_bounds_finite = get_action_bounds(env.action_space, device, action_dim)
     prior_checkpoint = args_cli.prior_checkpoint or checkpoint_args.get("prior_checkpoint")
     action_prior = None
     if prior_checkpoint:
@@ -243,6 +256,17 @@ def main() -> None:
             if args_cli.prior_residual_penalty is not None
             else checkpoint_args.get("prior_residual_penalty", 0.0)
         ),
+        prior_acceptance_margin=(
+            args_cli.prior_acceptance_margin
+            if args_cli.prior_acceptance_margin is not None
+            else checkpoint_args.get("prior_acceptance_margin", 0.0)
+        ),
+        prior_fallback=(
+            args_cli.prior_fallback
+            if args_cli.prior_fallback is not None
+            else checkpoint_args.get("prior_fallback", True)
+        ),
+        action_bounds_finite=checkpoint_args.get("action_bounds_finite", action_bounds_finite),
     )
 
     try:
@@ -304,6 +328,7 @@ def main() -> None:
                 completed_lengths.extend(done_lengths)
                 episode_returns[done_mask] = 0.0
                 episode_lengths[done_mask] = 0.0
+                planner.reset(done_mask)
 
             obs = next_obs
             steps += 1

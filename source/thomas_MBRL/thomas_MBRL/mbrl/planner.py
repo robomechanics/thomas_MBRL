@@ -23,6 +23,9 @@ class TrajectoryPlanner:
         action_prior: Callable[[torch.Tensor], torch.Tensor] | None = None,
         prior_residual_scale: float = 0.25,
         prior_residual_penalty: float = 0.0,
+        prior_acceptance_margin: float = 0.0,
+        prior_fallback: bool = True,
+        action_bounds_finite: bool = True,
     ):
         self.model = model
         self.action_low = action_low
@@ -36,7 +39,22 @@ class TrajectoryPlanner:
         self.action_prior = action_prior
         self.prior_residual_scale = prior_residual_scale
         self.prior_residual_penalty = prior_residual_penalty
+        self.prior_acceptance_margin = prior_acceptance_margin
+        self.prior_fallback = prior_fallback
+        self.action_bounds_finite = action_bounds_finite
         self._prev_mean: torch.Tensor | None = None
+
+    def reset(self, done: torch.Tensor | None = None) -> None:
+        if self._prev_mean is None:
+            return
+        if done is None:
+            self._prev_mean = None
+            return
+        done = done.to(device=self._prev_mean.device, dtype=torch.bool).view(-1)
+        if done.numel() != self._prev_mean.shape[0]:
+            self._prev_mean = None
+            return
+        self._prev_mean[done] = 0.0
 
     @property
     def control_horizon(self) -> int:
@@ -94,7 +112,12 @@ class TrajectoryPlanner:
             return controls
         return self._interpolate_action_spline(controls)
 
+    def _zero_controls(self, obs: torch.Tensor) -> torch.Tensor:
+        return torch.zeros((obs.shape[0], self.control_horizon, self.action_dim), device=obs.device, dtype=obs.dtype)
+
     def _clip_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        if not self.action_bounds_finite:
+            return actions
         return torch.max(torch.min(actions, self.action_high.view(1, -1)), self.action_low.view(1, -1))
 
     def _clip_action_sequences(self, action_sequences: torch.Tensor) -> torch.Tensor:
@@ -123,6 +146,16 @@ class TrajectoryPlanner:
         if self.action_prior is None:
             return self._clip_actions(controls_t)
         return self._actions_from_controls(obs, controls_t)
+
+    def _maybe_fallback_to_prior(self, obs: torch.Tensor, mean: torch.Tensor) -> torch.Tensor:
+        if self.action_prior is None or not self.prior_fallback:
+            return mean
+
+        candidate_return = self.evaluate_sequences(obs, self._expand_controls(mean).unsqueeze(1)).squeeze(1)
+        zero_mean = self._zero_controls(obs)
+        prior_return = self.evaluate_sequences(obs, self._expand_controls(zero_mean).unsqueeze(1)).squeeze(1)
+        accept = candidate_return >= prior_return + self.prior_acceptance_margin
+        return torch.where(accept.view(-1, 1, 1), mean, zero_mean)
 
     @torch.no_grad()
     def evaluate_sequences(self, obs: torch.Tensor, control_sequences: torch.Tensor) -> torch.Tensor:
@@ -166,6 +199,9 @@ class CEMPlanner(TrajectoryPlanner):
         action_prior: Callable[[torch.Tensor], torch.Tensor] | None = None,
         prior_residual_scale: float = 0.25,
         prior_residual_penalty: float = 0.0,
+        prior_acceptance_margin: float = 0.0,
+        prior_fallback: bool = True,
+        action_bounds_finite: bool = True,
     ):
         super().__init__(
             model=model,
@@ -179,6 +215,9 @@ class CEMPlanner(TrajectoryPlanner):
             action_prior=action_prior,
             prior_residual_scale=prior_residual_scale,
             prior_residual_penalty=prior_residual_penalty,
+            prior_acceptance_margin=prior_acceptance_margin,
+            prior_fallback=prior_fallback,
+            action_bounds_finite=action_bounds_finite,
         )
         self.elites = elites
         self.iterations = iterations
@@ -195,6 +234,8 @@ class CEMPlanner(TrajectoryPlanner):
             )
             controls = mean.unsqueeze(1) + std.unsqueeze(1) * noise
             controls = self._clip_controls(controls)
+            if self.action_prior is not None and controls.shape[1] > 0:
+                controls[:, 0, :, :] = 0.0
             action_sequences = self._expand_controls(controls)
 
             returns = self.evaluate_sequences(obs, action_sequences)
@@ -205,6 +246,7 @@ class CEMPlanner(TrajectoryPlanner):
             mean = elite_controls.mean(dim=1)
             std = elite_controls.std(dim=1).clamp_min(1e-3)
 
+        mean = self._maybe_fallback_to_prior(obs, mean)
         self._prev_mean = mean.detach()
         return self._first_action_from_controls(obs, mean)
 
@@ -227,6 +269,9 @@ class MPPIPlanner(TrajectoryPlanner):
         action_prior: Callable[[torch.Tensor], torch.Tensor] | None = None,
         prior_residual_scale: float = 0.25,
         prior_residual_penalty: float = 0.0,
+        prior_acceptance_margin: float = 0.0,
+        prior_fallback: bool = True,
+        action_bounds_finite: bool = True,
     ):
         super().__init__(
             model=model,
@@ -240,6 +285,9 @@ class MPPIPlanner(TrajectoryPlanner):
             action_prior=action_prior,
             prior_residual_scale=prior_residual_scale,
             prior_residual_penalty=prior_residual_penalty,
+            prior_acceptance_margin=prior_acceptance_margin,
+            prior_fallback=prior_fallback,
+            action_bounds_finite=action_bounds_finite,
         )
         self.iterations = iterations
         self.lambda_ = lambda_
@@ -256,6 +304,8 @@ class MPPIPlanner(TrajectoryPlanner):
             )
             controls = mean.unsqueeze(1) + std.unsqueeze(1) * noise
             controls = self._clip_controls(controls)
+            if self.action_prior is not None and controls.shape[1] > 0:
+                controls[:, 0, :, :] = 0.0
             action_sequences = self._expand_controls(controls)
             returns = self.evaluate_sequences(obs, action_sequences)
 
@@ -266,6 +316,7 @@ class MPPIPlanner(TrajectoryPlanner):
             variance = (weights.unsqueeze(-1).unsqueeze(-1) * centered.square()).sum(dim=1)
             std = variance.sqrt().clamp_min(1e-3)
 
+        mean = self._maybe_fallback_to_prior(obs, mean)
         self._prev_mean = mean.detach()
         return self._first_action_from_controls(obs, mean)
 
@@ -286,6 +337,9 @@ def build_planner(
     action_prior: Callable[[torch.Tensor], torch.Tensor] | None = None,
     prior_residual_scale: float = 0.25,
     prior_residual_penalty: float = 0.0,
+    prior_acceptance_margin: float = 0.0,
+    prior_fallback: bool = True,
+    action_bounds_finite: bool = True,
 ) -> TrajectoryPlanner:
     if planner_name == "mppi":
         return MPPIPlanner(
@@ -302,6 +356,9 @@ def build_planner(
             action_prior=action_prior,
             prior_residual_scale=prior_residual_scale,
             prior_residual_penalty=prior_residual_penalty,
+            prior_acceptance_margin=prior_acceptance_margin,
+            prior_fallback=prior_fallback,
+            action_bounds_finite=action_bounds_finite,
         )
     if planner_name == "cem":
         return CEMPlanner(
@@ -318,5 +375,8 @@ def build_planner(
             action_prior=action_prior,
             prior_residual_scale=prior_residual_scale,
             prior_residual_penalty=prior_residual_penalty,
+            prior_acceptance_margin=prior_acceptance_margin,
+            prior_fallback=prior_fallback,
+            action_bounds_finite=action_bounds_finite,
         )
     raise ValueError(f"Unsupported planner: {planner_name}")
