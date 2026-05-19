@@ -72,7 +72,26 @@ parser.add_argument(
     default=0,
     help="Sample this many cubic action-spline knots instead of one action per horizon step. Disabled when <=1.",
 )
-parser.add_argument("--prior_checkpoint", type=str, default=None, help="skrl policy checkpoint used as locomotion prior.")
+parser.add_argument("--prior_checkpoint", type=str, default=None, help="Policy checkpoint used as locomotion prior.")
+parser.add_argument(
+    "--prior_type",
+    type=str,
+    default="auto",
+    choices=["auto", "skrl", "torchscript", "rsl_jit"],
+    help="Locomotion prior format. auto tries TorchScript first, then skrl.",
+)
+parser.add_argument(
+    "--prior_obs_adapter",
+    type=str,
+    default="go2_rsl_rough",
+    help="Observation adapter for TorchScript priors.",
+)
+parser.add_argument(
+    "--prior_action_adapter",
+    type=str,
+    default="none",
+    help="Action adapter for TorchScript priors.",
+)
 parser.add_argument("--prior_task", type=str, default=None, help="Task used to load the prior policy config.")
 parser.add_argument("--prior_algorithm", type=str, default="PPO", help="skrl algorithm for the prior policy.")
 parser.add_argument("--prior_agent", type=str, default=None, help="Optional skrl prior agent config entry point.")
@@ -132,6 +151,14 @@ parser.add_argument(
     default=False,
     help="Sample nonzero movement commands instead of using the default standing/heading mix.",
 )
+parser.add_argument("--wander_x_min", type=float, default=-0.8, help="Minimum wander forward velocity command.")
+parser.add_argument("--wander_x_max", type=float, default=0.8, help="Maximum wander forward velocity command.")
+parser.add_argument("--wander_y_min", type=float, default=-0.4, help="Minimum wander lateral velocity command.")
+parser.add_argument("--wander_y_max", type=float, default=0.4, help="Maximum wander lateral velocity command.")
+parser.add_argument("--wander_yaw_min", type=float, default=-0.8, help="Minimum wander yaw velocity command.")
+parser.add_argument("--wander_yaw_max", type=float, default=0.8, help="Maximum wander yaw velocity command.")
+parser.add_argument("--wander_resample_min", type=float, default=3.0, help="Minimum wander command resample time.")
+parser.add_argument("--wander_resample_max", type=float, default=5.0, help="Maximum wander command resample time.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -147,7 +174,7 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
 
 import thomas_MBRL.tasks  # noqa: F401
-from thomas_MBRL.mbrl import DynamicsEnsemble, ReplayBuffer, SkrlPolicyPrior, build_planner
+from thomas_MBRL.mbrl import DynamicsEnsemble, ReplayBuffer, build_planner, load_policy_prior
 
 
 @dataclass
@@ -227,10 +254,10 @@ def apply_fixed_velocity_command(env_cfg: object) -> None:
 
     command_cfg = env_cfg.commands.base_velocity
     if args_cli.wander:
-        command_cfg.ranges.lin_vel_x = (-0.8, 0.8)
-        command_cfg.ranges.lin_vel_y = (-0.4, 0.4)
-        command_cfg.ranges.ang_vel_z = (-0.8, 0.8)
-        command_cfg.resampling_time_range = (3.0, 5.0)
+        command_cfg.ranges.lin_vel_x = (args_cli.wander_x_min, args_cli.wander_x_max)
+        command_cfg.ranges.lin_vel_y = (args_cli.wander_y_min, args_cli.wander_y_max)
+        command_cfg.ranges.ang_vel_z = (args_cli.wander_yaw_min, args_cli.wander_yaw_max)
+        command_cfg.resampling_time_range = (args_cli.wander_resample_min, args_cli.wander_resample_max)
     else:
         command_cfg.ranges.lin_vel_x = (args_cli.command_x or 0.0, args_cli.command_x or 0.0)
         command_cfg.ranges.lin_vel_y = (args_cli.command_y or 0.0, args_cli.command_y or 0.0)
@@ -319,14 +346,17 @@ def main() -> None:
     setattr(args_cli, "action_bounds_finite", action_bounds_finite)
     action_prior = None
     if args_cli.prior_checkpoint:
-        action_prior = SkrlPolicyPrior(
+        action_prior = load_policy_prior(
             env=env,
             checkpoint_path=args_cli.prior_checkpoint,
             task_name=args_cli.prior_task or args_cli.task,
+            prior_type=args_cli.prior_type,
             algorithm=args_cli.prior_algorithm,
             agent_cfg_entry_point=args_cli.prior_agent,
+            obs_adapter=args_cli.prior_obs_adapter,
+            action_adapter=args_cli.prior_action_adapter,
         )
-        print(f"[MBRL] Loaded locomotion prior: {os.path.abspath(args_cli.prior_checkpoint)}")
+        print(f"[MBRL] Loaded locomotion prior ({args_cli.prior_type}): {os.path.abspath(args_cli.prior_checkpoint)}")
 
     replay = ReplayBuffer(args_cli.buffer_capacity, obs_dim=obs_dim, action_dim=action_dim)
     model = DynamicsEnsemble(

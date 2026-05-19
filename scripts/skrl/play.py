@@ -48,6 +48,8 @@ parser.add_argument(
 )
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
+parser.add_argument("--num_episodes", type=int, default=0, help="Number of completed episodes to evaluate before exiting.")
+parser.add_argument("--max_steps", type=int, default=0, help="Maximum environment steps to run before exiting.")
 parser.add_argument("--command_x", type=float, default=None, help="Fixed forward velocity command in m/s.")
 parser.add_argument("--command_y", type=float, default=None, help="Fixed lateral velocity command in m/s.")
 parser.add_argument("--command_yaw", type=float, default=None, help="Fixed yaw velocity command in rad/s.")
@@ -57,6 +59,14 @@ parser.add_argument(
     default=False,
     help="Sample nonzero walking commands instead of the default heading-command mix.",
 )
+parser.add_argument("--wander_x_min", type=float, default=-0.8, help="Minimum wander forward velocity command.")
+parser.add_argument("--wander_x_max", type=float, default=0.8, help="Maximum wander forward velocity command.")
+parser.add_argument("--wander_y_min", type=float, default=-0.4, help="Minimum wander lateral velocity command.")
+parser.add_argument("--wander_y_max", type=float, default=0.4, help="Maximum wander lateral velocity command.")
+parser.add_argument("--wander_yaw_min", type=float, default=-0.8, help="Minimum wander yaw velocity command.")
+parser.add_argument("--wander_yaw_max", type=float, default=0.8, help="Maximum wander yaw velocity command.")
+parser.add_argument("--wander_resample_min", type=float, default=3.0, help="Minimum wander command resample time.")
+parser.add_argument("--wander_resample_max", type=float, default=5.0, help="Maximum wander command resample time.")
 # parser.add_argument(
 #     "--use_pretrained_checkpoint",
 #     action="store_true",
@@ -98,6 +108,7 @@ import random
 import time
 
 import gymnasium as gym
+import numpy as np
 import skrl
 import torch
 from packaging import version
@@ -155,10 +166,10 @@ def apply_velocity_command_overrides(env_cfg: object) -> None:
         raise AttributeError("This task config does not expose commands.base_velocity")
 
     if args_cli.wander:
-        command_cfg.ranges.lin_vel_x = (-0.8, 0.8)
-        command_cfg.ranges.lin_vel_y = (-0.4, 0.4)
-        command_cfg.ranges.ang_vel_z = (-0.8, 0.8)
-        command_cfg.resampling_time_range = (3.0, 5.0)
+        command_cfg.ranges.lin_vel_x = (args_cli.wander_x_min, args_cli.wander_x_max)
+        command_cfg.ranges.lin_vel_y = (args_cli.wander_y_min, args_cli.wander_y_max)
+        command_cfg.ranges.ang_vel_z = (args_cli.wander_yaw_min, args_cli.wander_yaw_max)
+        command_cfg.resampling_time_range = (args_cli.wander_resample_min, args_cli.wander_resample_max)
     else:
         command_cfg.ranges.lin_vel_x = (args_cli.command_x or 0.0, args_cli.command_x or 0.0)
         command_cfg.ranges.lin_vel_y = (args_cli.command_y or 0.0, args_cli.command_y or 0.0)
@@ -260,12 +271,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     # reset environment
     obs, _ = env.reset()
     timestep = 0
+    completed_returns: list[float] = []
+    completed_lengths: list[float] = []
+    command_error_xy: list[float] = []
+    command_error_yaw: list[float] = []
+    episode_returns = torch.zeros(obs.shape[0], dtype=torch.float32, device=obs.device)
+    episode_lengths = torch.zeros(obs.shape[0], dtype=torch.float32, device=obs.device)
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
 
         # run everything in inference mode
         with torch.inference_mode():
+            if isinstance(obs, torch.Tensor) and obs.shape[-1] >= 12:
+                command = obs[:, 9:12]
+                base_lin_vel = obs[:, 0:3]
+                base_ang_vel = obs[:, 3:6]
+                command_error_xy.append(torch.linalg.norm(base_lin_vel[:, :2] - command[:, :2], dim=-1).mean().item())
+                command_error_yaw.append((base_ang_vel[:, 2] - command[:, 2]).abs().mean().item())
             # agent stepping
             outputs = runner.agent.act(obs, timestep=0, timesteps=0)
             # - multi-agent (deterministic) actions
@@ -275,17 +298,53 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
             else:
                 actions = outputs[-1].get("mean_actions", outputs[0])
             # env stepping
-            obs, _, _, _, _ = env.step(actions)
+            obs, rewards, terminated, truncated, _ = env.step(actions)
+            rewards = rewards.float().view(-1)
+            done = terminated.bool().view(-1) | truncated.bool().view(-1)
+            episode_returns += rewards
+            episode_lengths += 1
+
+            if done.any():
+                done_returns = episode_returns[done].detach().cpu().tolist()
+                done_lengths = episode_lengths[done].detach().cpu().tolist()
+                completed_returns.extend(done_returns)
+                completed_lengths.extend(done_lengths)
+                episode_returns[done] = 0.0
+                episode_lengths[done] = 0.0
+
+        timestep += 1
         if args_cli.video:
-            timestep += 1
             # exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break
+        if args_cli.num_episodes > 0 and len(completed_returns) >= args_cli.num_episodes:
+            break
+        if args_cli.max_steps > 0 and timestep >= args_cli.max_steps:
+            break
 
         # time delay for real-time evaluation
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
+
+    if args_cli.num_episodes > 0 or args_cli.max_steps > 0:
+        eval_returns = completed_returns[: args_cli.num_episodes] if args_cli.num_episodes > 0 else completed_returns
+        eval_lengths = completed_lengths[: args_cli.num_episodes] if args_cli.num_episodes > 0 else completed_lengths
+        print(f"[EVAL] steps={timestep} completed_episodes={len(eval_returns)}")
+        if eval_returns:
+            print(
+                "[EVAL] "
+                f"mean_return={float(np.mean(eval_returns)):.3f} "
+                f"std_return={float(np.std(eval_returns)):.3f} "
+                f"mean_length={float(np.mean(eval_lengths)):.2f} "
+                f"min_length={float(np.min(eval_lengths)):.2f}"
+            )
+        if command_error_xy:
+            print(
+                "[EVAL] "
+                f"mean_cmd_xy_error={float(np.mean(command_error_xy)):.3f} "
+                f"mean_cmd_yaw_error={float(np.mean(command_error_yaw)):.3f}"
+            )
 
     # close the simulator
     env.close()

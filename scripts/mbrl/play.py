@@ -36,7 +36,26 @@ parser.add_argument("--real-time", action="store_true", default=False, help="Run
 parser.add_argument("--command_x", type=float, default=None, help="Fixed forward velocity command in m/s.")
 parser.add_argument("--command_y", type=float, default=None, help="Fixed lateral velocity command in m/s.")
 parser.add_argument("--command_yaw", type=float, default=None, help="Fixed yaw velocity command in rad/s.")
-parser.add_argument("--prior_checkpoint", type=str, default=None, help="Override skrl policy prior checkpoint.")
+parser.add_argument("--prior_checkpoint", type=str, default=None, help="Override policy prior checkpoint.")
+parser.add_argument(
+    "--prior_type",
+    type=str,
+    default=None,
+    choices=["auto", "skrl", "torchscript", "rsl_jit"],
+    help="Override locomotion prior format. auto tries TorchScript first, then skrl.",
+)
+parser.add_argument(
+    "--prior_obs_adapter",
+    type=str,
+    default=None,
+    help="Override observation adapter for TorchScript priors.",
+)
+parser.add_argument(
+    "--prior_action_adapter",
+    type=str,
+    default=None,
+    help="Override action adapter for TorchScript priors.",
+)
 parser.add_argument("--prior_task", type=str, default=None, help="Override task used to load the prior policy config.")
 parser.add_argument("--prior_algorithm", type=str, default=None, help="Override skrl algorithm for the prior policy.")
 parser.add_argument("--prior_agent", type=str, default=None, help="Override skrl prior agent config entry point.")
@@ -62,6 +81,14 @@ parser.add_argument(
     default=False,
     help="Sample nonzero movement commands instead of using the play environment's standing/heading mix.",
 )
+parser.add_argument("--wander_x_min", type=float, default=-0.8, help="Minimum wander forward velocity command.")
+parser.add_argument("--wander_x_max", type=float, default=0.8, help="Maximum wander forward velocity command.")
+parser.add_argument("--wander_y_min", type=float, default=-0.4, help="Minimum wander lateral velocity command.")
+parser.add_argument("--wander_y_max", type=float, default=0.4, help="Maximum wander lateral velocity command.")
+parser.add_argument("--wander_yaw_min", type=float, default=-0.8, help="Minimum wander yaw velocity command.")
+parser.add_argument("--wander_yaw_max", type=float, default=0.8, help="Maximum wander yaw velocity command.")
+parser.add_argument("--wander_resample_min", type=float, default=3.0, help="Minimum wander command resample time.")
+parser.add_argument("--wander_resample_max", type=float, default=5.0, help="Maximum wander command resample time.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -79,7 +106,7 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
 
 import thomas_MBRL.tasks  # noqa: F401
-from thomas_MBRL.mbrl import DynamicsEnsemble, SkrlPolicyPrior, build_planner
+from thomas_MBRL.mbrl import DynamicsEnsemble, build_planner, load_policy_prior
 
 
 def set_seed(seed: int) -> None:
@@ -153,10 +180,10 @@ def apply_fixed_velocity_command(env_cfg: object, checkpoint_args: dict) -> tupl
 
     command_cfg = env_cfg.commands.base_velocity
     if args_cli.wander:
-        command_cfg.ranges.lin_vel_x = (-0.8, 0.8)
-        command_cfg.ranges.lin_vel_y = (-0.4, 0.4)
-        command_cfg.ranges.ang_vel_z = (-0.8, 0.8)
-        command_cfg.resampling_time_range = (3.0, 5.0)
+        command_cfg.ranges.lin_vel_x = (args_cli.wander_x_min, args_cli.wander_x_max)
+        command_cfg.ranges.lin_vel_y = (args_cli.wander_y_min, args_cli.wander_y_max)
+        command_cfg.ranges.ang_vel_z = (args_cli.wander_yaw_min, args_cli.wander_yaw_max)
+        command_cfg.resampling_time_range = (args_cli.wander_resample_min, args_cli.wander_resample_max)
     else:
         command_cfg.ranges.lin_vel_x = (command_x, command_x)
         command_cfg.ranges.lin_vel_y = (command_y, command_y)
@@ -212,62 +239,68 @@ def main() -> None:
     prior_checkpoint = args_cli.prior_checkpoint or checkpoint_args.get("prior_checkpoint")
     action_prior = None
     if prior_checkpoint:
-        action_prior = SkrlPolicyPrior(
+        prior_type = args_cli.prior_type or checkpoint_args.get("prior_type", "auto")
+        action_prior = load_policy_prior(
             env=env,
             checkpoint_path=prior_checkpoint,
             task_name=args_cli.prior_task or checkpoint_args.get("prior_task") or checkpoint_args.get("task", task_name),
+            prior_type=prior_type,
             algorithm=args_cli.prior_algorithm or checkpoint_args.get("prior_algorithm", "PPO"),
             agent_cfg_entry_point=args_cli.prior_agent or checkpoint_args.get("prior_agent"),
+            obs_adapter=args_cli.prior_obs_adapter or checkpoint_args.get("prior_obs_adapter", "go2_rsl_rough"),
+            action_adapter=args_cli.prior_action_adapter or checkpoint_args.get("prior_action_adapter", "none"),
         )
-        print(f"[INFO] Loaded locomotion prior: {os.path.abspath(prior_checkpoint)}")
-
-    model = DynamicsEnsemble(
-        obs_dim=obs.shape[-1],
-        action_dim=action_dim,
-        ensemble_size=checkpoint_args["ensemble_size"],
-        hidden_dim=checkpoint_args["hidden_dim"],
-        depth=checkpoint_args["model_depth"],
-    ).to(device)
-    model.load_state_dict(checkpoint["model"])
-    model.eval()
+        print(f"[INFO] Loaded locomotion prior ({prior_type}): {os.path.abspath(prior_checkpoint)}")
 
     planner_name = checkpoint_args.get("planner", "mppi")
-    planner = build_planner(
-        planner_name=planner_name,
-        model=model,
-        action_low=action_low,
-        action_high=action_high,
-        horizon=checkpoint_args["horizon"],
-        candidates=checkpoint_args["candidates"],
-        elites=checkpoint_args.get("elites", 32),
-        iterations=checkpoint_args.get("planner_iterations", checkpoint_args.get("cem_iterations", 4)),
-        discount=checkpoint_args["discount"],
-        temperature=checkpoint_args.get("planner_temperature", 0.5),
-        lambda_=checkpoint_args.get("mppi_lambda", 1.0),
-        action_spline_knots=checkpoint_args.get("action_spline_knots", 0),
-        action_prior=action_prior,
-        prior_residual_scale=(
-            args_cli.prior_residual_scale
-            if args_cli.prior_residual_scale is not None
-            else checkpoint_args.get("prior_residual_scale", 0.25)
-        ),
-        prior_residual_penalty=(
-            args_cli.prior_residual_penalty
-            if args_cli.prior_residual_penalty is not None
-            else checkpoint_args.get("prior_residual_penalty", 0.0)
-        ),
-        prior_acceptance_margin=(
-            args_cli.prior_acceptance_margin
-            if args_cli.prior_acceptance_margin is not None
-            else checkpoint_args.get("prior_acceptance_margin", 0.0)
-        ),
-        prior_fallback=(
-            args_cli.prior_fallback
-            if args_cli.prior_fallback is not None
-            else checkpoint_args.get("prior_fallback", True)
-        ),
-        action_bounds_finite=checkpoint_args.get("action_bounds_finite", action_bounds_finite),
-    )
+    planner = None
+    if not args_cli.prior_only:
+        model = DynamicsEnsemble(
+            obs_dim=obs.shape[-1],
+            action_dim=action_dim,
+            ensemble_size=checkpoint_args["ensemble_size"],
+            hidden_dim=checkpoint_args["hidden_dim"],
+            depth=checkpoint_args["model_depth"],
+        ).to(device)
+        model.load_state_dict(checkpoint["model"])
+        model.eval()
+
+        planner = build_planner(
+            planner_name=planner_name,
+            model=model,
+            action_low=action_low,
+            action_high=action_high,
+            horizon=checkpoint_args["horizon"],
+            candidates=checkpoint_args["candidates"],
+            elites=checkpoint_args.get("elites", 32),
+            iterations=checkpoint_args.get("planner_iterations", checkpoint_args.get("cem_iterations", 4)),
+            discount=checkpoint_args["discount"],
+            temperature=checkpoint_args.get("planner_temperature", 0.5),
+            lambda_=checkpoint_args.get("mppi_lambda", 1.0),
+            action_spline_knots=checkpoint_args.get("action_spline_knots", 0),
+            action_prior=action_prior,
+            prior_residual_scale=(
+                args_cli.prior_residual_scale
+                if args_cli.prior_residual_scale is not None
+                else checkpoint_args.get("prior_residual_scale", 0.25)
+            ),
+            prior_residual_penalty=(
+                args_cli.prior_residual_penalty
+                if args_cli.prior_residual_penalty is not None
+                else checkpoint_args.get("prior_residual_penalty", 0.0)
+            ),
+            prior_acceptance_margin=(
+                args_cli.prior_acceptance_margin
+                if args_cli.prior_acceptance_margin is not None
+                else checkpoint_args.get("prior_acceptance_margin", 0.0)
+            ),
+            prior_fallback=(
+                args_cli.prior_fallback
+                if args_cli.prior_fallback is not None
+                else checkpoint_args.get("prior_fallback", True)
+            ),
+            action_bounds_finite=checkpoint_args.get("action_bounds_finite", action_bounds_finite),
+        )
 
     try:
         dt = env.step_dt
@@ -283,7 +316,12 @@ def main() -> None:
     print(f"[INFO] Evaluating task={task_name} num_envs={args_cli.num_envs} num_episodes={args_cli.num_episodes}")
     print(f"[INFO] Planner={'prior_only' if args_cli.prior_only else planner_name}")
     if args_cli.wander:
-        print("[INFO] Velocity command=wander")
+        print(
+            "[INFO] Velocity command=wander "
+            f"x=({args_cli.wander_x_min:.3f}, {args_cli.wander_x_max:.3f}) "
+            f"y=({args_cli.wander_y_min:.3f}, {args_cli.wander_y_max:.3f}) "
+            f"yaw=({args_cli.wander_yaw_min:.3f}, {args_cli.wander_yaw_max:.3f})"
+        )
     elif command_x is not None:
         print(f"[INFO] Velocity command=({command_x:.3f}, {command_y:.3f}, {command_yaw:.3f})")
 
@@ -304,12 +342,19 @@ def main() -> None:
             else:
                 actions = planner.plan(obs)
             if args_cli.debug_actions and steps % 100 == 0:
-                command_obs = obs[:, 9:12] if obs.shape[-1] >= 12 else None
+                if obs.shape[-1] == 45:
+                    command_obs = obs[:, 6:9]
+                elif obs.shape[-1] >= 12:
+                    command_obs = obs[:, 9:12]
+                else:
+                    command_obs = None
                 print(
                     "[DEBUG] "
                     f"step={steps} "
+                    f"obs_dim={obs.shape[-1]} "
                     f"action_abs_mean={actions.abs().mean().item():.4f} "
                     f"action_abs_max={actions.abs().max().item():.4f} "
+                    f"action_first={actions[0].detach().cpu().tolist()} "
                     f"command_obs={command_obs[0].detach().cpu().tolist() if command_obs is not None else None}"
                 )
             next_obs_raw, rewards, terminated, truncated, _ = env.step(actions)
@@ -328,7 +373,8 @@ def main() -> None:
                 completed_lengths.extend(done_lengths)
                 episode_returns[done_mask] = 0.0
                 episode_lengths[done_mask] = 0.0
-                planner.reset(done_mask)
+                if planner is not None:
+                    planner.reset(done_mask)
 
             obs = next_obs
             steps += 1

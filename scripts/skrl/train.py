@@ -53,6 +53,14 @@ parser.add_argument(
     default=False,
     help="Sample nonzero walking commands instead of the default heading-command mix.",
 )
+parser.add_argument("--wander_x_min", type=float, default=-0.8, help="Minimum wander forward velocity command.")
+parser.add_argument("--wander_x_max", type=float, default=0.8, help="Maximum wander forward velocity command.")
+parser.add_argument("--wander_y_min", type=float, default=-0.4, help="Minimum wander lateral velocity command.")
+parser.add_argument("--wander_y_max", type=float, default=0.4, help="Maximum wander lateral velocity command.")
+parser.add_argument("--wander_yaw_min", type=float, default=-0.8, help="Minimum wander yaw velocity command.")
+parser.add_argument("--wander_yaw_max", type=float, default=0.8, help="Maximum wander yaw velocity command.")
+parser.add_argument("--wander_resample_min", type=float, default=3.0, help="Minimum wander command resample time.")
+parser.add_argument("--wander_resample_max", type=float, default=5.0, help="Maximum wander command resample time.")
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -254,10 +262,10 @@ def apply_velocity_command_overrides(env_cfg: object) -> None:
         raise AttributeError("This task config does not expose commands.base_velocity")
 
     if args_cli.wander:
-        command_cfg.ranges.lin_vel_x = (-0.8, 0.8)
-        command_cfg.ranges.lin_vel_y = (-0.4, 0.4)
-        command_cfg.ranges.ang_vel_z = (-0.8, 0.8)
-        command_cfg.resampling_time_range = (3.0, 5.0)
+        command_cfg.ranges.lin_vel_x = (args_cli.wander_x_min, args_cli.wander_x_max)
+        command_cfg.ranges.lin_vel_y = (args_cli.wander_y_min, args_cli.wander_y_max)
+        command_cfg.ranges.ang_vel_z = (args_cli.wander_yaw_min, args_cli.wander_yaw_max)
+        command_cfg.resampling_time_range = (args_cli.wander_resample_min, args_cli.wander_resample_max)
     else:
         command_cfg.ranges.lin_vel_x = (args_cli.command_x or 0.0, args_cli.command_x or 0.0)
         command_cfg.ranges.lin_vel_y = (args_cli.command_y or 0.0, args_cli.command_y or 0.0)
